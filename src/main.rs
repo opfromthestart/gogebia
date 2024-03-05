@@ -1,6 +1,14 @@
-use std::{collections::BTreeMap, time::Duration};
+mod formula;
+
+use std::{
+    collections::BTreeMap,
+    ops::{Deref, DerefMut},
+    str::FromStr,
+    time::Duration,
+};
 
 use flate2::Compression;
+use formula::CellData;
 use sdl2::{
     event::{Event, WindowEvent},
     keyboard::Keycode,
@@ -13,6 +21,28 @@ use sdl2::{
 const BLACK: Color = Color::RGB(20, 20, 20);
 const BLUE: Color = Color::RGB(90, 90, 180);
 const WHITE: Color = Color::RGB(200, 200, 200);
+
+// type Sheet = BTreeMap<(i32, i32), CellData>;
+type SLoc = (i32, i32);
+struct Sheet(BTreeMap<SLoc, CellData>);
+
+impl Deref for Sheet {
+    type Target = BTreeMap<SLoc, CellData>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl DerefMut for Sheet {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Sheet {
+    fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+}
 
 /*
 Notes/todo:
@@ -34,13 +64,13 @@ special symbols:
 eg value(.C, .R)==..
 [.C+10,.R+10]=.C+.R is a range equal, works on an 11x11 area, and starts in the cell it is entered in
 empty defaults to .C for column and .R for row, so [,]= is the same as =
-
 value(C,R) gets the value in that cell, also value((C,R))
 range(C1,R1,C2=.I,R2=.I) gets cells in rectangular area from (C1,R1) to (C2, R2)
 row(R) is reference to range(.C,R,.I,R)
 col(C) is reference to range(C,.R,C,.I)
 [,.I]=value(.C,.R-1)+1 increments by 1
 [,.I]=F(value(.C-1,.R)) maps column to function of cells to the left
+[,.SR+A1]=.R will fill A1 cells with their row nums
 A reference like C4 is always static
 pos(range, val) returns (C,R) where value((C,R))==val
 // findif(range, expr) returns a value, findif(range(1,1), .FV>20)
@@ -103,7 +133,7 @@ fn main() {
     // let window = canvas.into_window();
 
     let mut selected = None;
-    let mut data: BTreeMap<(i32, i32), String> = BTreeMap::new();
+    let mut data = Sheet::new();
     let mut cursor = None;
 
     if let Some(filen) = std::env::args().nth(1) {
@@ -118,7 +148,12 @@ fn main() {
                     continue;
                 };
                 for (j, entry) in line.iter().enumerate() {
-                    data.insert((j as i32, i as i32), entry.to_owned());
+                    if !entry.is_empty() {
+                        data.insert(
+                            (j as i32, i as i32),
+                            CellData::from_str(&entry.to_owned()).unwrap(),
+                        );
+                    }
                 }
             }
         } else {
@@ -154,7 +189,6 @@ fn main() {
                         true
                     } else if new.0 >= 0 && new.1 >= 0 {
                         selected = Some(new);
-                        cursor = Some(0);
                         true
                     } else {
                         selected = None;
@@ -175,49 +209,75 @@ fn main() {
                     if let Some(key) = keycode {
                         if let Some((x, y)) = selected {
                             if key == Keycode::Backspace {
-                                if !data.contains_key(&(x, y)) {
-                                    assert!(data.insert((x, y), "".into()).is_none());
+                                if let Some(cur) = cursor {
+                                    if let Some(dmut) = data.get_mut(&(x, y)) {
+                                        let dp = dmut.val.len();
+                                        if cur > 0 && cur <= dp {
+                                            dmut.val.remove(cur - 1);
+                                            cursor = Some(cur - 1);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    data.remove(&(x, y));
+                                    let _ = data.dirty(&(x, y));
+                                    true
                                 }
-                                let dp = data.get(&(x, y)).unwrap().len().checked_sub(1);
-                                if let Some(dp) = dp {
-                                    data.get_mut(&(x, y)).unwrap().remove(dp);
+                                // dbg!(&data.get(&(x, y)).unwrap());
+                            } else if key == Keycode::Return {
+                                if cursor.is_some() {
+                                    let _ = data.dirty(&(x, y));
+                                    selected = Some((x, y + 1));
+                                    cursor = None;
+                                } else {
+                                    cursor = Some(0);
                                 }
-                                dbg!(&data.get(&(x, y)).unwrap());
                                 true
-                            } else if key == Keycode::Return || key == Keycode::Down {
+                            } else if key == Keycode::Down {
                                 selected = Some((x, y + 1));
+                                cursor = None;
                                 true
                             } else if key == Keycode::Left {
                                 if let Some(cpos) = cursor {
                                     if cpos == 0 {
                                         selected = Some(((x - 1).max(0), y));
-                                        cursor = Some(0);
+                                        cursor = None;
                                     } else {
                                         cursor = Some(cpos - 1);
                                     }
                                 } else {
-                                    println!("Weird error, selected but not cursor");
+                                    selected = Some(((x - 1).max(0), y));
                                 }
                                 true
                             } else if key == Keycode::Right {
                                 if let Some(cpos) = cursor {
                                     if cpos
-                                        == data.get(&(x, y)).map(|x| x as &str).unwrap_or("").len()
+                                        == data
+                                            .get(&(x, y))
+                                            .map(|x| &x.val as &str)
+                                            .unwrap_or("")
+                                            .len()
                                     {
                                         selected = Some((x + 1, y));
-                                        cursor = Some(0);
+                                        cursor = None;
                                     } else {
                                         cursor = Some(cpos + 1);
                                     }
                                 } else {
-                                    println!("Weird error, selected but not cursor");
+                                    selected = Some((x + 1, y));
                                 }
                                 true
                             } else if key == Keycode::Up {
                                 selected = Some((x, (y - 1).max(0)));
+                                cursor = None;
                                 true
                             } else if key == Keycode::Escape {
                                 selected = None;
+                                cursor = None;
                                 true
                             } else {
                                 false
@@ -240,11 +300,13 @@ fn main() {
                 } => {
                     if let Some((x, y)) = selected {
                         if !data.contains_key(&(x, y)) {
-                            assert!(data.insert((x, y), "".into()).is_none());
+                            assert!(data
+                                .insert((x, y), CellData::from_str("").unwrap())
+                                .is_none());
                         }
                         // data.get_mut(&(x, y)).unwrap().push_str(&text);
                         if let Some(cpos) = cursor {
-                            data.get_mut(&(x, y)).unwrap().insert_str(cpos, &text);
+                            data.get_mut(&(x, y)).unwrap().val.insert_str(cpos, &text);
                             cursor = Some(cpos + text.len());
                             true
                         } else {
@@ -269,6 +331,8 @@ fn main() {
         framecount = (framecount + 1) % 60;
         // println!("{framecount}");
         if dirty {
+            data.recompute();
+
             canvas.set_draw_color(WHITE);
             canvas.clear();
 
@@ -302,8 +366,11 @@ fn main() {
                     let Some(s) = data.get(&(x, y)) else {
                         continue;
                     };
-                    if !s.is_empty() && Some((x, y)) != selected {
-                        let text = cellfont.render(s).solid(BLACK).unwrap();
+                    if s.display.is_some() && Some((x, y)) != selected {
+                        let text = cellfont
+                            .render(s.display.as_ref().unwrap())
+                            .solid(BLACK)
+                            .unwrap();
                         let text_text = texturer.create_texture_from_surface(text).unwrap();
                         let sm = text_text.query();
                         let (copyw, copyh) = { (cellw as u32, cellh as u32) };
@@ -330,7 +397,7 @@ fn main() {
 
             if let Some((x, y)) = selected {
                 if let Some(s) = data.get(&(x, y)) {
-                    match mainfont.render(s).solid(BLACK) {
+                    match mainfont.render(&s.val).solid(BLACK) {
                         Ok(text) => {
                             let text_text = texturer.create_texture_from_surface(text).unwrap();
                             let sm = text_text.query();
@@ -351,7 +418,14 @@ fn main() {
                             // dbg!(e);
                         }
                     }
-                    match cellfont.render(s).solid(BLACK) {
+                    match cellfont
+                        .render(if cursor.is_some() {
+                            &s.val
+                        } else {
+                            s.display.as_ref().unwrap()
+                        })
+                        .solid(BLACK)
+                    {
                         Ok(text) => {
                             let text_text = texturer.create_texture_from_surface(text).unwrap();
                             let sm = text_text.query();
@@ -392,7 +466,7 @@ fn main() {
                 if let Some(s) = data.get(&selected.unwrap()) {
                     canvas
                         .draw_rect(Rect::new(
-                            mainfont.size_of(&s[0..cpos]).unwrap().0 as i32 - border / 2,
+                            mainfont.size_of(&s.val[0..cpos]).unwrap().0 as i32 - border / 2,
                             menu + border / 2,
                             border as u32,
                             (top - menu - border / 2) as u32,
@@ -420,7 +494,7 @@ fn main() {
                 let mut rec: Vec<&str> = vec![];
                 for j in 0..=max_x {
                     if let Some(v) = data.get(&(j, i)) {
-                        rec.push(v);
+                        rec.push(&v.val);
                     } else {
                         rec.push("");
                     }
