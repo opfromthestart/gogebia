@@ -8,7 +8,7 @@ use std::{
 };
 
 use flate2::Compression;
-use formula::CellData;
+use formula::{CellData, Function};
 use sdl2::{
     event::{Event, WindowEvent},
     keyboard::Keycode,
@@ -24,7 +24,7 @@ const WHITE: Color = Color::RGB(200, 200, 200);
 
 // type Sheet = BTreeMap<(i32, i32), CellData>;
 type SLoc = (i32, i32);
-struct Sheet(BTreeMap<SLoc, CellData>);
+struct Sheet(BTreeMap<SLoc, CellData>, Vec<Box<dyn Function>>);
 
 impl Deref for Sheet {
     type Target = BTreeMap<SLoc, CellData>;
@@ -40,7 +40,13 @@ impl DerefMut for Sheet {
 }
 impl Sheet {
     fn new() -> Self {
-        Self(BTreeMap::new())
+        Self(BTreeMap::new(), vec![])
+    }
+    fn add_func<F: Function + Default + 'static + 'static>(&mut self) {
+        self.1.push(Box::new(F::default()))
+    }
+    fn get_func(&self, name: &str) -> Option<&dyn Function> {
+        self.1.iter().find(|f| f.name() == name).map(|x| x.as_ref())
     }
 }
 
@@ -52,7 +58,7 @@ entered variable, left/right work on cells when not entered, work on cursor when
 
 formulas
 special symbols:
-.. current cell
+.. current cell but dont use this
 .C current column as int
 .R current row as int
 .SC range equation starting column as int
@@ -134,6 +140,7 @@ fn main() {
 
     let mut selected = None;
     let mut data = Sheet::new();
+    data.add_func::<formula::If>();
     let mut cursor = None;
 
     if let Some(filen) = std::env::args().nth(1) {
