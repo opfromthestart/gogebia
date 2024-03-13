@@ -8,7 +8,7 @@ use std::{
 };
 
 use flate2::Compression;
-use formula::{CellData, Function};
+use formula::{CellData, CellError, Function};
 use sdl2::{
     event::{Event, WindowEvent},
     keyboard::Keycode,
@@ -23,11 +23,74 @@ const BLUE: Color = Color::RGB(90, 90, 180);
 const WHITE: Color = Color::RGB(200, 200, 200);
 
 // type Sheet = BTreeMap<(i32, i32), CellData>;
-type SLoc = (i32, i32);
-struct Sheet(BTreeMap<SLoc, CellData>, Vec<Box<dyn Function>>);
+// whut
+pub(crate) type SLoc = (i32, i32);
+#[derive(Debug)]
+pub(crate) struct SheetData(BTreeMap<SLoc, CellData>);
+pub(crate) type SheetEval = BTreeMap<SLoc, usize>;
+pub(crate) struct SheetFunc(Vec<Box<dyn Function>>);
+impl SheetFunc {
+    fn iter(&self) -> impl Iterator<Item = &Box<dyn Function>> {
+        self.0.iter()
+    }
+}
 
+struct Sheet(
+    pub(crate) SheetData,
+    pub(crate) SheetEval,
+    pub(crate) SheetFunc,
+);
+impl std::fmt::Debug for Sheet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)?;
+        for v in self.2.iter() {
+            write!(f, "{},", v.name())?;
+        }
+        Ok(())
+    }
+}
+
+// impl Deref for Sheet {
+//     type Target = BTreeMap<SLoc, CellData>;
+
+//     fn deref(&self) -> &Self::Target {
+//         &self.0
+//     }
+// }
+// impl DerefMut for Sheet {
+//     fn deref_mut(&mut self) -> &mut Self::Target {
+//         &mut self.0
+//     }
+// }
+impl SheetFunc {
+    fn add_func<F: Function + Default + 'static>(&mut self) {
+        self.0.push(Box::new(F::default()))
+    }
+    fn get_func(&self, name: &str) -> Option<&dyn Function> {
+        self.0.iter().find(|f| f.name() == name).map(|x| x.as_ref())
+    }
+}
+impl Sheet {
+    fn new() -> Self {
+        Self(
+            SheetData(BTreeMap::new()),
+            BTreeMap::new(),
+            SheetFunc(vec![]),
+        )
+    }
+    fn get(&self, cell: &SLoc) -> Result<&CellData, CellError> {
+        self.0.get(cell, &self.1)
+    }
+    fn get_mut(&mut self, cell: &SLoc) -> Result<&mut CellData, CellError> {
+        self.0.get_mut(cell, &self.1)
+    }
+    fn insert(&mut self, cell: SLoc, val: CellData) -> Option<CellData> {
+        self.1.insert(cell.clone(), 0);
+        self.0.insert(cell, val)
+    }
+}
 impl Deref for Sheet {
-    type Target = BTreeMap<SLoc, CellData>;
+    type Target = SheetData;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -38,15 +101,66 @@ impl DerefMut for Sheet {
         &mut self.0
     }
 }
-impl Sheet {
-    fn new() -> Self {
-        Self(BTreeMap::new(), vec![])
+impl SheetData {
+    fn insert(&mut self, cell: SLoc, val: CellData) -> Option<CellData> {
+        self.0.insert(cell, val)
     }
-    fn add_func<F: Function + Default + 'static + 'static>(&mut self) {
-        self.1.push(Box::new(F::default()))
+    fn get(&self, cell: &SLoc, eval: &SheetEval) -> Result<&CellData, CellError> {
+        if let Some(c) = self.0.get(cell) {
+            if let Some(e) = eval.get(cell) {
+                if e != &0 {
+                    Err(CellError::ReferenceLoop {
+                        loop_point: Some(*cell),
+                    })
+                } else {
+                    Ok(c)
+                }
+            } else {
+                panic!("No 1")
+            }
+        } else {
+            Err(CellError::MissingCell { cell: Some(*cell) })
+        }
     }
-    fn get_func(&self, name: &str) -> Option<&dyn Function> {
-        self.1.iter().find(|f| f.name() == name).map(|x| x.as_ref())
+    fn get_mut(&mut self, cell: &SLoc, eval: &SheetEval) -> Result<&mut CellData, CellError> {
+        // dbg!(&self.0);
+        if let Some(c) = self.0.get_mut(cell) {
+            if let Some(e) = eval.get(cell) {
+                if e != &0 {
+                    Err(CellError::ReferenceLoop {
+                        loop_point: Some(*cell),
+                    })
+                } else {
+                    Ok(c)
+                }
+            } else {
+                panic!("No 2")
+            }
+        } else {
+            Err(CellError::MissingCell { cell: Some(*cell) })
+        }
+    }
+    fn remove(&mut self, cell: &SLoc) {
+        self.0.remove(cell);
+    }
+    fn contains_key(&self, cell: &SLoc) -> bool {
+        self.0.contains_key(cell)
+    }
+    fn keys(&self) -> impl Iterator<Item = &SLoc> {
+        self.0.keys()
+    }
+    fn iter(&self) -> impl Iterator<Item = (&SLoc, &CellData)> {
+        self.0.iter()
+    }
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&SLoc, &mut CellData)> {
+        self.0.iter_mut()
+    }
+    fn val_mut(&mut self, cell: &SLoc) -> Option<&mut String> {
+        if let Some(c) = self.0.get_mut(cell) {
+            Some(&mut c.val)
+        } else {
+            None
+        }
     }
 }
 
@@ -140,7 +254,10 @@ fn main() {
 
     let mut selected = None;
     let mut data = Sheet::new();
-    data.add_func::<formula::If>();
+    data.2.add_func::<formula::If>();
+    data.2.add_func::<formula::Sum>();
+    data.2.add_func::<formula::ValueFunc>();
+    data.2.add_func::<formula::CountIf>();
     let mut cursor = None;
 
     if let Some(filen) = std::env::args().nth(1) {
@@ -217,7 +334,7 @@ fn main() {
                         if let Some((x, y)) = selected {
                             if key == Keycode::Backspace {
                                 if let Some(cur) = cursor {
-                                    if let Some(dmut) = data.get_mut(&(x, y)) {
+                                    if let Ok(dmut) = data.get_mut(&(x, y)) {
                                         let dp = dmut.val.len();
                                         if cur > 0 && cur <= dp {
                                             dmut.val.remove(cur - 1);
@@ -240,6 +357,7 @@ fn main() {
                                     let _ = data.dirty(&(x, y));
                                     selected = Some((x, y + 1));
                                     cursor = None;
+                                    let _ = data.dirty(&(x, y));
                                 } else {
                                     cursor = Some(0);
                                 }
@@ -247,12 +365,14 @@ fn main() {
                             } else if key == Keycode::Down {
                                 selected = Some((x, y + 1));
                                 cursor = None;
+                                let _ = data.dirty(&(x, y));
                                 true
                             } else if key == Keycode::Left {
                                 if let Some(cpos) = cursor {
                                     if cpos == 0 {
                                         selected = Some(((x - 1).max(0), y));
                                         cursor = None;
+                                        let _ = data.dirty(&(x, y));
                                     } else {
                                         cursor = Some(cpos - 1);
                                     }
@@ -271,6 +391,7 @@ fn main() {
                                     {
                                         selected = Some((x + 1, y));
                                         cursor = None;
+                                        let _ = data.dirty(&(x, y));
                                     } else {
                                         cursor = Some(cpos + 1);
                                     }
@@ -281,6 +402,7 @@ fn main() {
                             } else if key == Keycode::Up {
                                 selected = Some((x, (y - 1).max(0)));
                                 cursor = None;
+                                let _ = data.dirty(&(x, y));
                                 true
                             } else if key == Keycode::Escape {
                                 selected = None;
@@ -313,7 +435,7 @@ fn main() {
                         }
                         // data.get_mut(&(x, y)).unwrap().push_str(&text);
                         if let Some(cpos) = cursor {
-                            data.get_mut(&(x, y)).unwrap().val.insert_str(cpos, &text);
+                            data.val_mut(&(x, y)).unwrap().insert_str(cpos, &text);
                             cursor = Some(cpos + text.len());
                             true
                         } else {
@@ -338,6 +460,7 @@ fn main() {
         framecount = (framecount + 1) % 60;
         // println!("{framecount}");
         if dirty {
+            dbg!(cursor);
             data.recompute();
 
             canvas.set_draw_color(WHITE);
@@ -370,14 +493,15 @@ fn main() {
 
             for x in 0..=(width / cellw) {
                 for y in 0..=(h34 / cellh) {
-                    let Some(s) = data.get(&(x, y)) else {
+                    let Ok(s) = data.get(&(x, y)) else {
                         continue;
                     };
                     if s.display.is_some() && Some((x, y)) != selected {
-                        let text = cellfont
-                            .render(s.display.as_ref().unwrap())
-                            .solid(BLACK)
-                            .unwrap();
+                        let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
+                        else {
+                            // If empty string
+                            continue;
+                        };
                         let text_text = texturer.create_texture_from_surface(text).unwrap();
                         let sm = text_text.query();
                         let (copyw, copyh) = { (cellw as u32, cellh as u32) };
@@ -403,7 +527,7 @@ fn main() {
             }
 
             if let Some((x, y)) = selected {
-                if let Some(s) = data.get(&(x, y)) {
+                if let Ok(s) = data.get(&(x, y)) {
                     match mainfont.render(&s.val).solid(BLACK) {
                         Ok(text) => {
                             let text_text = texturer.create_texture_from_surface(text).unwrap();
@@ -470,7 +594,7 @@ fn main() {
 
             if let Some(cpos) = cursor {
                 canvas.set_draw_color(BLACK);
-                if let Some(s) = data.get(&selected.unwrap()) {
+                if let Ok(s) = data.get(&selected.unwrap()) {
                     canvas
                         .draw_rect(Rect::new(
                             mainfont.size_of(&s.val[0..cpos]).unwrap().0 as i32 - border / 2,
@@ -500,7 +624,7 @@ fn main() {
             for i in 0..=max_y {
                 let mut rec: Vec<&str> = vec![];
                 for j in 0..=max_x {
-                    if let Some(v) = data.get(&(j, i)) {
+                    if let Ok(v) = data.get(&(j, i)) {
                         rec.push(&v.val);
                     } else {
                         rec.push("");
