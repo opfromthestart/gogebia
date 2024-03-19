@@ -29,6 +29,19 @@ pub(crate) struct SpecValues {
     depth: usize,
 }
 impl SpecValues {
+    fn from_sloc(sloc: SLoc) -> Self {
+        Self {
+            dC: sloc.0,
+            dR: sloc.1,
+            dSd: None,
+            dSC: None,
+            dSR: None,
+            dFd: None,
+            dFC: None,
+            dFR: None,
+            depth: 0,
+        }
+    }
     fn to_sloc(&self) -> SLoc {
         (self.dC, self.dR)
     }
@@ -107,11 +120,40 @@ pub(crate) enum CellError {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SLocBound(Bound, Bound);
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Range(SLoc, SLocBound);
+impl From<&SLoc> for Range {
+    fn from(value: &SLoc) -> Self {
+        Self(
+            value.clone(),
+            SLocBound(Bound::Fin(value.0), Bound::Fin(value.1)),
+        )
+    }
+}
+impl Range {
+    fn range(cell1: SLoc, cell2: SLoc) -> Self {
+        Self(cell1, SLocBound(Bound::Fin(cell2.0), Bound::Fin(cell2.1)))
+    }
+    fn range_inf(cell: SLoc) -> Self {
+        Self(cell, SLocBound(Bound::Inf, Bound::Inf))
+    }
+    fn in_range(&self, cell: &SLoc) -> bool {
+        if cell.0 < self.0 .0 || cell.1 < self.0 .1 {
+            false
+        } else {
+            self.1 .0.ge(cell.0) && self.1 .1.ge(cell.1)
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Const {
     Num(f64),
     String(String),
     Bool(bool),
     Error(CellError),
+    Range(Range),
 }
 
 impl Into<String> for &Const {
@@ -121,17 +163,13 @@ impl Into<String> for &Const {
             Const::String(s) => s.clone(),
             Const::Bool(b) => format!("{b}"),
             Const::Error(e) => format!("{e:?}"),
+            Const::Range(_) => format!("Range is not valid here"),
         }
     }
 }
 impl Into<String> for Const {
     fn into(self) -> String {
-        match self {
-            Const::Num(n) => format!("{n}"),
-            Const::String(s) => s,
-            Const::Bool(b) => format!("{b}"),
-            Const::Error(e) => format!("{e:?}"),
-        }
+        (&self).into()
     }
 }
 impl FromStr for Const {
@@ -214,7 +252,6 @@ impl Const {
 pub(crate) enum Value {
     Const(Const),
     Ref(SLoc),
-    Range(SLoc, SLoc),
     Special(Spec),
     Add(Rc<Value>, Rc<Value>),
     Sub(Rc<Value>, Rc<Value>),
@@ -414,8 +451,8 @@ fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
             (Value::Const(c), false)
         } else if let Some(s) = is_spec(sp[0].0) {
             (Value::Special(s), false)
-        } else if let Some((l, h)) = is_range(sp[0].0) {
-            (Value::Range(l, h), false)
+        } else if let Some(r) = is_range(sp[0].0) {
+            (Value::Const(Const::Range(r)), false)
         } else {
             (
                 Value::Const(Const::Error(CellError::InvalidFormula {
@@ -783,6 +820,17 @@ fn is_ref(token: &str) -> Option<SLoc> {
     }
 }
 
+pub(crate) fn show_ref(loc: &SLoc) -> String {
+    let mut c = String::new();
+    let mut cn = loc.0 + 1;
+    while cn > 0 {
+        c.insert(0, (('A' as u8) + ((cn - 1) as u8) % 26) as char);
+        // TODO this probably doesnt work
+        cn = (cn - 1) / 26;
+    }
+    format!("{}{}", c, loc.1 + 1)
+}
+
 fn is_const(token: &str) -> Option<Const> {
     if token.chars().next() == Some('"') && token.chars().last() == Some('"') {
         Some(Const::String(token.to_owned()))
@@ -794,14 +842,23 @@ fn is_const(token: &str) -> Option<Const> {
         None
     }
 }
-fn is_range(token: &str) -> Option<(SLoc, SLoc)> {
+fn is_range(token: &str) -> Option<Range> {
     let mut split = token.split(":");
     let start = is_ref(split.next()?)?;
-    let end = is_ref(split.next()?)?;
-    if split.next().is_some() {
-        return None;
+    if let Some(nx) = split.next() {
+        if &nx == &"" {
+            Some(Range::range_inf(start))
+        } else {
+            let end = is_ref(nx)?;
+            if split.next().is_some() {
+                None
+            } else {
+                Some(Range::range(start, end))
+            }
+        }
+    } else {
+        None
     }
-    Some((start, end))
 }
 fn is_spec(token: &str) -> Option<Spec> {
     match token {
@@ -863,6 +920,11 @@ impl Value {
         }
         eval.get_mut(&l).map(|x| *x = spec.depth);
         let t = match self {
+            Value::Const(Const::Range(_)) => Cow::Owned(Const::Error(CellError::InvalidFormula {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                reason: "Range cannot be assigned to a cell",
+            })),
             Value::Const(c) => Cow::Borrowed(c),
             Value::Ref(r) => Cow::Owned({
                 let vr = data
@@ -886,11 +948,6 @@ impl Value {
                     .unwrap_or_else(|e| e);
                 vr
             }),
-            Value::Range(_, _) => Cow::Owned(Const::Error(CellError::InvalidFormula {
-                cell: Some(spec.to_sloc()),
-                cursor: 0,
-                reason: "Range cannot be assigned to a cell",
-            })),
             Value::Add(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
@@ -1065,36 +1122,62 @@ impl Value {
         t
     }
 
-    fn get_refs(&self) -> Vec<SLoc> {
+    fn get_refs(
+        &self,
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
         match self {
-            Value::Ref(r) => vec![*r],
+            Value::Ref(r) => vec![r.into()],
             Value::Add(lhs, rhs)
             | Value::Sub(lhs, rhs)
             | Value::Mul(lhs, rhs)
             | Value::Div(lhs, rhs)
             | Value::Eq(lhs, rhs)
             | Value::And(lhs, rhs)
-            | Value::Lt(lhs, rhs) => [lhs, rhs].iter().flat_map(|s| s.get_refs()).collect(),
-            Value::Func { name: _, args } => args.iter().flat_map(|a| a.get_refs()).collect(),
+            | Value::Lt(lhs, rhs) => [lhs, rhs]
+                .iter()
+                .flat_map(|s| s.get_refs(data, eval, func, spec))
+                .collect(),
+            Value::Func { name, args } => func
+                .get_func(name)
+                .iter()
+                .flat_map(|f| f.get_refs(args, data, eval, func, spec))
+                .collect(),
+            Value::Const(Const::Range(r)) => vec![r.clone()],
             Value::Const(_) | Value::Special(_) => vec![],
-            Value::Range(l, h) => RangeIter(*l, *h, 0).collect(),
         }
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum Bound {
+    Fin(i32),
+    Inf,
+}
+impl Bound {
+    fn ge(&self, v: i32) -> bool {
+        match self {
+            Bound::Fin(n) => &v <= n,
+            Bound::Inf => true,
+        }
+    }
+}
 struct RangeFormula {
-    rbound: Value,
-    cbound: Value,
+    rbound: Bound,
+    cbound: Bound,
     conditon: Value,
     value: Value,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct CellData {
-    // val: Value,
     pub(crate) val: String,
+
     /// Is none when recalculating
-    pub(crate) parsed: Option<Value>,
+    // pub(crate) parsed: Option<Value>,
     pub(crate) display: Option<String>,
     // Flag for detecting loops
     /// Dependants, aka cells that depend on this one
@@ -1112,29 +1195,32 @@ impl FromStr for CellData {
             display: None,
             dependants: HashSet::new(),
             rangef: None,
-            parsed: None,
+            // parsed: None,
         };
 
         Ok(c)
     }
 }
 
-// impl CellData {
-//     fn dirty(&mut self, data: &mut Sheet) {
-//         self.display = None;
-//         for dep in self.deps.iter() {
-//             if let Some(dcell) = data.get_mut(dep) {
-//                 dcell.dirty(data);
-//             }
-//         }
-//     }
+impl CellData {
+    //     fn dirty(&mut self, data: &mut Sheet) {
+    //         self.display = None;
+    //         for dep in self.deps.iter() {
+    //             if let Some(dcell) = data.get_mut(dep) {
+    //                 dcell.dirty(data);
+    //             }
+    //         }
+    //     }
 
-//     fn calc(&mut self, data: &Sheet) {
-//         let v: Value = self.val.parse().unwrap();
-//         let c = v.eval(sheet);
+    //     fn calc(&mut self, data: &Sheet) {
+    //         let v: Value = self.val.parse().unwrap();
+    //         let c = v.eval(sheet);
 
-//     }
-// }
+    //     }
+    pub(crate) fn val(self, val: String) -> Self {
+        Self { val, ..self }
+    }
+}
 impl Sheet {
     fn set_eval(&mut self, cell: &SLoc, eval: usize) {
         if let Some(c) = self.1.get_mut(cell) {
@@ -1181,15 +1267,22 @@ impl Sheet {
     pub(crate) fn recompute(&mut self) {
         println!("Recompute");
         let kc: Vec<_> = self.keys().cloned().collect();
-        for pos in kc {
+        dbg!(&self);
+        dbg!(&kc);
+        for pos in kc.iter() {
             // Remove dependants that dont depend
             let s = self.get(&pos);
             let mut torem = HashSet::new();
             if let Ok(s) = s {
-                for p in s.dependants.iter() {
+                for p in s.dependants.clone().iter() {
                     if let Ok(deps) = self.get(p) {
                         if let Ok(pv) = deps.val.parse::<Value>() {
-                            if !pv.get_refs().contains(&pos) {
+                            if !pv
+                                .get_refs(&self.0, &mut self.1, &self.2, &SpecValues::from_sloc(*p))
+                                .iter()
+                                .any(|r| r.in_range(&pos))
+                            {
+                                println!("Removing dependant {p:?} from {pos:?}");
                                 torem.insert(*p);
                             }
                         }
@@ -1208,6 +1301,35 @@ impl Sheet {
                 }
             }
         }
+        for pos in kc.iter() {
+            let s = self.get(&pos);
+            let mut toadd = None;
+            if let Ok(s) = s {
+                if let Ok(pv) = s.val.parse::<Value>() {
+                    toadd = Some(pv.get_refs(
+                        &self.0,
+                        &mut self.1,
+                        &self.2,
+                        &SpecValues::from_sloc(*pos),
+                    ));
+                }
+            }
+            let mut dirty_flag = false;
+            if let Some(toadd) = toadd {
+                for posd in kc.iter() {
+                    if toadd.iter().any(|r| r.in_range(posd)) {
+                        if let Ok(c2) = self.get_mut(posd) {
+                            c2.dependants.insert(*pos);
+                            dirty_flag = dirty_flag || c2.display.is_none();
+                        }
+                    }
+                }
+            }
+            if dirty_flag {
+                self.dirty(&pos);
+            }
+        }
+        dbg!(&self);
         loop {
             let recpos = self
                 .iter()
@@ -1222,12 +1344,11 @@ impl Sheet {
                 .next();
             if let Some(pos) = recpos {
                 self.dirty(&pos);
-
                 let s = self.get(&pos);
                 // dbg!(&s);
                 // This will return error if a reference loop is reached.
                 // This needs to continue to properly do reference loop detection and proper text updating, so I cant early return/continue
-                let mut val = if let Ok(s) = s {
+                let val = if let Ok(s) = s {
                     let val = s.val.clone();
                     val.parse::<Value>().unwrap()
                 } else {
@@ -1235,22 +1356,32 @@ impl Sheet {
                 };
 
                 // Add depends
-                let depends = val.get_refs();
+                // let depends =
+                //     val.get_refs(&self.0, &mut self.1, &self.2, &SpecValues::from_sloc(pos));
                 // dbg!(&depends);
-                for d in depends {
-                    if let Ok(dc) = self.get_mut(&d) {
-                        dc.dependants.insert(pos);
-                    } else {
-                        let mut cd = CellData::default();
-                        cd.dependants.insert(pos);
-                        let _ = self.insert(d, cd);
-                    }
-                    if d == pos {
-                        val = Value::Const(Const::Error(CellError::ReferenceLoop {
-                            loop_point: Some(pos),
-                        }));
-                    }
-                }
+                // todo!("Need to reverse this to iterate over self instead");
+                // for d in depends {
+                //     if let Ok(dc) = self.get_mut(&d.0) {
+                //         dc.dependants.insert(pos);
+                //     } else {
+                //         let mut cd = CellData::default();
+                //         cd.dependants.insert(pos);
+                //         let _ = self.insert(d.0, cd);
+                //     }
+                //     if d.0 == pos {
+                //         val = Value::Const(Const::Error(CellError::ReferenceLoop {
+                //             loop_point: Some(pos),
+                //         }));
+                //     }
+                // }
+                // for dc in self.0 .0.iter_mut() {
+                //     for d in depends.iter() {
+                //         if d.in_range(dc.0) {
+                //             dc.1.dependants.insert(pos);
+                //         }
+                //     }
+                // }
+                // self.dirty(&pos);
 
                 let spec = SpecValues {
                     dC: pos.0,
@@ -1302,6 +1433,18 @@ pub(crate) trait Function {
         func: &SheetFunc,
         spec: &SpecValues,
     ) -> Const;
+    fn get_refs(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
+        args.iter()
+            .flat_map(|a| a.get_refs(data, eval, func, spec))
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -1346,23 +1489,6 @@ impl Function for If {
     }
 }
 
-struct RangeIter(SLoc, SLoc, usize);
-impl Iterator for RangeIter {
-    type Item = SLoc;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let height = self.1 .0 - self.0 .0 + 1;
-        let width = self.1 .1 - self.0 .1 + 1;
-        if self.2 == (width * height) as usize {
-            None
-        } else {
-            let t = Some((self.2 as i32 % height, self.2 as i32 / height));
-            self.2 += 1;
-            t
-        }
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct Sum;
 impl Function for Sum {
@@ -1387,9 +1513,9 @@ impl Function for Sum {
             expected_types: vec!["Cell or range...".into()],
         });
         for a in args {
-            if let Value::Range(low, high) = a {
+            if let Value::Const(Const::Range(r)) = a {
                 // dbg!(data);
-                for elem in RangeIter(*low, *high, 0) {
+                for elem in data.keys().filter(|k| r.in_range(k)) {
                     // dbg!(&elem);
                     let v = (&data).get(&elem, &eval);
                     let v = match v {
@@ -1401,9 +1527,9 @@ impl Function for Sum {
                     };
                     // dbg!(v);
                     let Ok(v) = v.val.parse::<Value>() else {
-                        return Const::Error(CellError::MissingCell { cell: Some(elem) });
+                        return Const::Error(CellError::MissingCell { cell: Some(*elem) });
                     };
-                    let new_spec = spec.clone().with_sloc(elem);
+                    let new_spec = spec.clone().with_sloc(*elem);
                     // dbg!(&new_spec);
                     let cv = v.eval(data, eval, func, &new_spec);
                     if let Const::Num(n) = cv.as_ref() {
@@ -1422,6 +1548,28 @@ impl Function for Sum {
             }
         }
         Const::Num(s)
+    }
+
+    fn get_refs(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
+        let mut refs: Vec<_> = args
+            .iter()
+            .flat_map(|a| a.get_refs(data, eval, func, spec))
+            .collect();
+        refs.extend(args.iter().flat_map(|a| {
+            if let Value::Const(Const::Range(r)) = a {
+                vec![r.clone()]
+            } else {
+                a.get_refs(data, eval, func, spec)
+            }
+        }));
+        refs
     }
 }
 #[derive(Default)]
@@ -1482,7 +1630,6 @@ impl Function for ValueFunc {
         let r = *r as i32;
 
         let rf = data.get(&(c, r), &eval);
-        // TODO add dependency here
         if let Err(e) = rf {
             return Const::Error(e);
         }
@@ -1500,6 +1647,38 @@ impl Function for ValueFunc {
         let new_spec = spec.clone().with_sloc((c, r));
 
         val.eval(data, eval, func, &new_spec).into_owned()
+    }
+    fn get_refs(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
+        let mut refs = args
+            .iter()
+            .flat_map(|a| a.get_refs(data, eval, func, spec))
+            .collect();
+        let [c, r] = args else {
+            return refs;
+        };
+        let c = c.eval(data, eval, func, spec);
+        let Const::Num(c) = c.as_ref() else {
+            return refs;
+        };
+        let r = r.eval(data, eval, func, spec);
+        let Const::Num(r) = r.as_ref() else {
+            return refs;
+        };
+        // TODO make this more rigid, find good way to do a let else
+        if c < &0. || c != &c.round() || r < &0. || &r.round() != r {
+            return refs;
+        }
+        let c = *c as i32;
+        let r = *r as i32;
+        refs.push((&(c, r)).into());
+        refs
     }
 }
 
@@ -1526,19 +1705,19 @@ impl Function for CountIf {
                 arguments: vec![2],
             });
         };
-        let Value::Range(rl, rh) = range else {
+        let Value::Const(Const::Range(r)) = range else {
             return Const::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Range".into()],
             });
         };
-        dbg!(cond);
-        for cell in RangeIter(*rl, *rh, 0) {
+        // dbg!(cond);
+        for cell in data.keys().filter(|k| r.in_range(k)) {
             let Ok(celldata) = data.get(&cell, eval) else {
                 continue;
             };
-            let inner_spec = spec.clone().with_sloc(cell);
+            let inner_spec = spec.clone().with_sloc(*cell);
             let val = celldata.val.parse::<Value>();
             if let Err(val) = val {
                 return Const::Error(CellError::InvalidFormula {
@@ -1550,13 +1729,88 @@ impl Function for CountIf {
             let val = val.unwrap();
             let cval = val.eval(data, eval, func, &inner_spec).into_owned();
 
-            let fspec = spec.clone().with_f_sloc(Some((cell, cval)));
+            let fspec = spec.clone().with_f_sloc(Some((*cell, cval)));
             // dbg!(spec, &fspec);
 
-            if let Const::Bool(true) = dbg!(cond.eval(data, eval, func, &fspec).as_ref()) {
+            if let Const::Bool(true) = cond.eval(data, eval, func, &fspec).as_ref() {
                 count += 1;
             };
         }
         Const::Num(count as f64)
+    }
+
+    fn get_refs(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
+        let mut refs = args
+            .iter()
+            .flat_map(|a| a.get_refs(data, eval, func, spec))
+            .collect();
+        let Value::Const(Const::Range(r)) = &args[0] else {
+            return refs;
+        };
+        refs.push(r.clone());
+        // dbg!(&refs);
+        refs
+    }
+}
+
+#[derive(Default)]
+struct RangeFunc;
+impl Function for RangeFunc {
+    fn get_refs(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
+        let mut refs = args
+            .iter()
+            .flat_map(|a| a.get_refs(data, eval, func, spec))
+            .collect();
+        if let [c, r] = args {
+            let c = c.eval(data, eval, func, spec);
+            let Const::Num(c) = c.as_ref() else {
+                return refs;
+            };
+            let r = r.eval(data, eval, func, spec);
+            let Const::Num(r) = r.as_ref() else {
+                return refs;
+            };
+            // TODO make this more rigid, find good way to do a let else
+            if c < &0. || c != &c.round() || r < &0. || &r.round() != r {
+                return refs;
+            }
+            let c = *c as i32;
+            let r = *r as i32;
+            refs.push((&(c, r)).into());
+            refs
+        } else if let [c1, r1, c2, r2] = args {
+            refs
+        } else {
+            refs
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "range"
+    }
+
+    fn call(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Const {
+        todo!()
     }
 }

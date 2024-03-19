@@ -1,17 +1,18 @@
+#![feature(int_roundings)]
 mod formula;
 
 use std::{
     collections::BTreeMap,
-    ops::{Deref, DerefMut},
+    ops::{Add, Deref, DerefMut},
     str::FromStr,
     time::Duration,
 };
 
 use flate2::Compression;
-use formula::{CellData, CellError, Function};
+use formula::{show_ref, CellData, CellError, Function};
 use sdl2::{
     event::{Event, WindowEvent},
-    keyboard::Keycode,
+    keyboard::{Keycode, Mod},
     mouse::MouseButton,
     pixels::Color,
     rect::Rect,
@@ -162,6 +163,14 @@ impl SheetData {
             None
         }
     }
+    fn set_val(&mut self, cell: &SLoc, val: String) {
+        if let Some(c) = self.val_mut(cell) {
+            *c = val;
+        } else {
+            // TODO some checks on being in ranges and things
+            self.0.insert(*cell, CellData::default().val(val));
+        }
+    }
 }
 
 /*
@@ -175,33 +184,37 @@ special symbols:
 .. current cell but dont use this
 .C current column as int
 .R current row as int
+.S. range equation starting value (not really valid for same reason as ..)
 .SC range equation starting column as int
 .SR range equation starting row as int
 .FC lambda cell
 .FR lambda row
 .F. lambda value
 .I infinity
+.HRed, .HGreen cell highlight, .Hff0000
 eg value(.C, .R)==..
-[.C+10,.R+10]=.C+.R is a range equal, works on an 11x11 area, and starts in the cell it is entered in
+[10,10]=.C+.R is a range equal, works on an 10x10 area, and starts in the cell it is entered in
 empty defaults to .C for column and .R for row, so [,]= is the same as =
 value(C,R) gets the value in that cell, also value((C,R))
-range(C1,R1,C2=.I,R2=.I) gets cells in rectangular area from (C1,R1) to (C2, R2)
-row(R) is reference to range(.C,R,.I,R)
-col(C) is reference to range(C,.R,C,.I)
+// range(C1,R1,C2=.I,R2=.I) gets cells in rectangular area from (C1,R1) to (C2, R2)
+No, i think range wont work, maybe special range const
+// row(R) is reference to range(.C,R,.I,R)
+// col(C) is reference to range(C,.R,C,.I)
 [,.I]=value(.C,.R-1)+1 increments by 1
 [,.I]=F(value(.C-1,.R)) maps column to function of cells to the left
-[,.SR+A1]=.R will fill A1 cells with their row nums
+// [,.SR+A1]=.R will fill A1 cells with their row nums
+[,.I,.SR-.R<A1]=.R
 A reference like C4 is always static
 pos(range, val) returns (C,R) where value((C,R))==val
-// findif(range, expr) returns a value, findif(range(1,1), .FV>20)
+findif(range, expr) returns a value, findif(A1:E30, .FV>20)
 can also use while logic in range
-[cell(.C,.R-1)<2]=cell(.C,.R-1)*1.05, exponential
+[,.I,value(.C,.R-1)<2]=value(.C,.R-1)*1.05, exponential
 [] cannot self-reference, and it will not be evaluated in cells not in range(.SC, .SR), and a cell cannot be a part of two range calculations
 no loops of two cells with []
-[.C==.SC] is equivalent to [,.I]
+// [.C==.SC] is equivalent to [,.I]
 [,.I]=filter(col(.C-1), .F.<20) will fill the column will values in the first that are less than 20. use filter without range to do findif
 string splitting can be done automatically as well
-[.C+5,.I]=split(cell(.SC-1,.R), " "), which will put the first 6 words in the column to the left into different columns on the right
+[5,.I]=split(value(.SC-1,.R), " "), which will put the first 6 words in the column to the left into different columns on the right
 
 Dragging prediction
 if arithmetic or geometric, continue the pattern
@@ -210,10 +223,42 @@ else, repeat until end.
 numsolve
 numsolve(LHS, RHS, start) will try to solve LHS=RHS, numsolve must be recursive
 numsolve(..*..,2, 1) will set value to sqrt(2)
+
+color function sets cell color
+=color(value(.C-1, .R), .F.<0, .HRed, .HGreen) last one is default
+=color(form, .HYellow) always makes it yellow
+
+Cell and range insertions into a formula by click, drag
+scrolling
+zoom
+
+menu
+file picker (rfd)
+idk what else a menu needs
+
+header row that is sticky
 */
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Dirty {
+    No,
+    Visual,
+    Recompute,
+}
+impl Add for Dirty {
+    type Output = Dirty;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Dirty::Recompute, _) | (_, Dirty::Recompute) => Dirty::Recompute,
+            (Dirty::Visual, _) | (_, Dirty::Visual) => Dirty::Visual,
+            (Dirty::No, Dirty::No) => Dirty::No,
+        }
+    }
+}
+
 fn main() {
-    let (window, mut events_loop, _context) = {
+    let (window, mut events_loop, _context, keys) = {
         let sdl = sdl2::init().unwrap();
         let video = sdl.video().unwrap();
         let gl_attr = video.gl_attr();
@@ -229,19 +274,26 @@ fn main() {
         // let gl = unsafe {
         //     glow::Context::from_loader_function(|s| video.gl_get_proc_address(s) as *const _)
         // };
-        let event_loop = sdl.event_pump().unwrap();
-        (window, event_loop, gl_context)
+        (
+            window,
+            sdl.event_pump().unwrap(),
+            gl_context,
+            sdl.keyboard(),
+        )
     };
 
     // let cellsx: i32 = 20;
     // let cellsy: i32 = 18;
-    let cellw = 60;
+    let cellw = 120;
     let cellh: i32 = 30;
     let menu = 48;
     let top: i32 = 96;
     let border = 4;
     let mut height = 800;
     let mut width = 1200;
+    let mut scroll = (0, 0);
+    // let mut shifted = false;
+    let sensitivity = cellh / 3;
 
     let sdlttf = ttf::init().unwrap();
     let mainfont = sdlttf.load_font("UbuntuMono-Regular.ttf", 48).unwrap();
@@ -253,12 +305,16 @@ fn main() {
     // let window = canvas.into_window();
 
     let mut selected = None;
+    let mut prev_val = None;
     let mut data = Sheet::new();
     data.2.add_func::<formula::If>();
     data.2.add_func::<formula::Sum>();
     data.2.add_func::<formula::ValueFunc>();
     data.2.add_func::<formula::CountIf>();
     let mut cursor = None;
+    let mut form_select_start = None;
+    let mut form_select_end = None;
+    let mut form_select_cursor = None;
 
     if let Some(filen) = std::env::args().nth(1) {
         if let Ok(file_zipped) = std::fs::File::open(filen) {
@@ -288,12 +344,21 @@ fn main() {
     }
 
     let mut framecount = 0;
+    // when i do caching dont do this
+    let mut start = true;
 
     'main: loop {
         // if let Some(Event::Quit { timestamp: _ }) = events_loop.poll_event() {
         //     break 'main;
         // }
-        let mut dirty = framecount == 0;
+        let mut dirty: Dirty = if start {
+            Dirty::Recompute
+        } else if framecount == 0 {
+            Dirty::Visual
+        } else {
+            Dirty::No
+        };
+        start = false;
         while let Some(e) = events_loop.poll_event() {
             dirty = match e {
                 Event::Quit { timestamp: _ } => break 'main,
@@ -306,21 +371,98 @@ fn main() {
                     x,
                     y,
                 } => {
-                    let new = ((x / cellw), (y - top) / cellh);
-                    let t = if y < top || selected == Some(new) {
-                        selected = None;
-                        cursor = None;
-                        true
-                    } else if new.0 >= 0 && new.1 >= 0 {
-                        selected = Some(new);
-                        true
+                    let new = (((x + scroll.0) / cellw), ((y + scroll.1) - top) / cellh);
+                    if y < top {
+                        // TODO menu and clicking into formula
+                        Dirty::No
                     } else {
-                        selected = None;
-                        cursor = None;
-                        true
-                    };
-                    dbg!(selected);
-                    t
+                        if let Some(cur) = cursor {
+                            if let Some(s) = selected {
+                                form_select_start = Some(new);
+
+                                let show = show_ref(&new);
+                                form_select_cursor = Some(cur..cur + show.len());
+                                cursor = Some(cur + show.len());
+                                // dbg!(&show);
+                                if let Some(v) = data.val_mut(&s) {
+                                    v.insert_str(cur, &show);
+                                    Dirty::Visual
+                                } else {
+                                    Dirty::No
+                                }
+                            } else {
+                                Dirty::No
+                            }
+                        } else {
+                            let t = if y < top || selected == Some(new) {
+                                Dirty::No
+                            } else if new.0 >= 0 && new.1 >= 0 {
+                                selected = Some(new);
+                                Dirty::Visual
+                            } else {
+                                selected = None;
+                                cursor = None;
+                                Dirty::Visual
+                            };
+
+                            dbg!(selected);
+                            t
+                        }
+                    }
+                }
+                Event::MouseMotion {
+                    timestamp: _,
+                    window_id: _,
+                    which: _,
+                    mousestate: _,
+                    x,
+                    y,
+                    xrel: _,
+                    yrel: _,
+                } => {
+                    let curc = ((x / cellw), (y - top) / cellh);
+                    if y < top {
+                        // TODO menu and clicking into formula
+                        Dirty::No
+                    } else {
+                        if let (Some(s), Some(start), Some(form_cur)) =
+                            (selected, form_select_start, form_select_cursor.clone())
+                        {
+                            if Some(curc) != form_select_end {
+                                println!("{curc:?}");
+                                form_select_end = Some(curc);
+
+                                let shows = show_ref(&start);
+                                let showe = show_ref(&curc);
+                                println!("{}:{}", shows, showe);
+                                if let Some(v) = data.val_mut(&s) {
+                                    if curc > start {
+                                        let rang = format!("{}:{}", shows, showe);
+                                        form_select_cursor =
+                                            Some(form_cur.start..form_cur.start + rang.len());
+                                        cursor = Some(form_cur.start + rang.len());
+                                        v.replace_range(form_cur, &rang);
+                                        Dirty::Visual
+                                    } else if curc < start {
+                                        let rang = format!("{}:{}", showe, shows);
+                                        form_select_cursor =
+                                            Some(form_cur.start..form_cur.start + rang.len());
+                                        cursor = Some(form_cur.start + rang.len());
+                                        v.replace_range(form_cur, &rang);
+                                        Dirty::Visual
+                                    } else {
+                                        Dirty::No
+                                    }
+                                } else {
+                                    Dirty::No
+                                }
+                            } else {
+                                Dirty::No
+                            }
+                        } else {
+                            Dirty::No
+                        }
+                    }
                 }
                 Event::KeyDown {
                     timestamp: _,
@@ -330,6 +472,11 @@ fn main() {
                     keymod: _,
                     repeat: _,
                 } => {
+                    // if keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD) {
+                    //     shifted = true;
+                    // } else {
+                    //     shifted = false;
+                    // }
                     if let Some(key) = keycode {
                         if let Some((x, y)) = selected {
                             if key == Keycode::Backspace {
@@ -339,17 +486,17 @@ fn main() {
                                         if cur > 0 && cur <= dp {
                                             dmut.val.remove(cur - 1);
                                             cursor = Some(cur - 1);
-                                            true
+                                            Dirty::Visual
                                         } else {
-                                            false
+                                            Dirty::No
                                         }
                                     } else {
-                                        false
+                                        Dirty::No
                                     }
                                 } else {
-                                    data.remove(&(x, y));
                                     let _ = data.dirty(&(x, y));
-                                    true
+                                    data.remove(&(x, y));
+                                    Dirty::Recompute
                                 }
                                 // dbg!(&data.get(&(x, y)).unwrap());
                             } else if key == Keycode::Return {
@@ -357,29 +504,35 @@ fn main() {
                                     let _ = data.dirty(&(x, y));
                                     selected = Some((x, y + 1));
                                     cursor = None;
-                                    let _ = data.dirty(&(x, y));
                                 } else {
                                     cursor = Some(0);
                                 }
-                                true
+                                Dirty::Recompute
                             } else if key == Keycode::Down {
                                 selected = Some((x, y + 1));
                                 cursor = None;
-                                let _ = data.dirty(&(x, y));
-                                true
+                                if (y + 2) * cellh >= height - top + scroll.1 {
+                                    scroll.1 = (y + 2 - (height - top) / cellh) * cellh;
+                                }
+                                Dirty::Visual
                             } else if key == Keycode::Left {
                                 if let Some(cpos) = cursor {
                                     if cpos == 0 {
-                                        selected = Some(((x - 1).max(0), y));
-                                        cursor = None;
-                                        let _ = data.dirty(&(x, y));
+                                        // selected = Some(((x - 1).max(0), y));
+                                        // cursor = None;
+                                        // let _ = data.dirty(&(x, y));
+                                        Dirty::No
                                     } else {
                                         cursor = Some(cpos - 1);
+                                        Dirty::Visual
                                     }
                                 } else {
                                     selected = Some(((x - 1).max(0), y));
+                                    if (x - 1) * cellw < scroll.0 {
+                                        scroll.0 = (x - 1).max(0) * cellw;
+                                    }
+                                    Dirty::Visual
                                 }
-                                true
                             } else if key == Keycode::Right {
                                 if let Some(cpos) = cursor {
                                     if cpos
@@ -389,37 +542,63 @@ fn main() {
                                             .unwrap_or("")
                                             .len()
                                     {
-                                        selected = Some((x + 1, y));
-                                        cursor = None;
-                                        let _ = data.dirty(&(x, y));
+                                        // selected = Some((x + 1, y));
+                                        // cursor = None;
+                                        // let _ = data.dirty(&(x, y));
+                                        Dirty::No
                                     } else {
                                         cursor = Some(cpos + 1);
+                                        Dirty::Visual
                                     }
                                 } else {
                                     selected = Some((x + 1, y));
+                                    if (x + 2) * cellw > width + scroll.0 {
+                                        scroll.0 = (x + 2 - width / cellw) * cellw;
+                                    }
+                                    Dirty::Visual
                                 }
-                                true
                             } else if key == Keycode::Up {
                                 selected = Some((x, (y - 1).max(0)));
                                 cursor = None;
-                                let _ = data.dirty(&(x, y));
-                                true
+                                if (y - 1) * cellh < scroll.1 {
+                                    scroll.1 = (y - 1).max(0) * cellh;
+                                }
+                                Dirty::Visual
                             } else if key == Keycode::Escape {
-                                selected = None;
-                                cursor = None;
-                                true
+                                if cursor.is_some() {
+                                    if let Some(fc) = form_select_cursor.clone() {
+                                        if let Some(v) = data.val_mut(&(x, y)) {
+                                            v.replace_range(fc, "");
+                                            form_select_cursor = None;
+                                            form_select_start = None;
+                                            form_select_end = None;
+                                        }
+                                    } else {
+                                        cursor = None;
+                                        let p = prev_val;
+                                        prev_val = None;
+                                        if let Some(prev) = p {
+                                            data.set_val(&(x, y), prev);
+                                        } else {
+                                            data.set_val(&(x, y), "".into());
+                                        }
+                                    }
+                                } else {
+                                    selected = None;
+                                }
+                                Dirty::Visual
                             } else {
-                                false
+                                Dirty::No
                             }
                         } else {
                             if key == Keycode::Escape {
                                 break 'main;
                             } else {
-                                false
+                                Dirty::No
                             }
                         }
                     } else {
-                        false
+                        Dirty::No
                     }
                 }
                 Event::TextInput {
@@ -437,12 +616,18 @@ fn main() {
                         if let Some(cpos) = cursor {
                             data.val_mut(&(x, y)).unwrap().insert_str(cpos, &text);
                             cursor = Some(cpos + text.len());
-                            true
+                            form_select_cursor = None;
+                            form_select_start = None;
+                            form_select_end = None;
+                            Dirty::Visual
                         } else {
-                            false
+                            prev_val = data.val_mut(&(x, y)).cloned();
+                            cursor = Some(text.len());
+                            data.set_val(&(x, y), text);
+                            Dirty::Visual
                         }
                     } else {
-                        false
+                        Dirty::No
                     }
                 }
                 Event::Window {
@@ -452,19 +637,41 @@ fn main() {
                 } => {
                     width = nw;
                     height = nh;
-                    true
+                    Dirty::Visual
                 }
-                _ => false,
-            } || dirty;
+                Event::MouseWheel {
+                    timestamp: _,
+                    window_id: _,
+                    which: _,
+                    mut x,
+                    mut y,
+                    direction: _,
+                    precise_x: _,
+                    precise_y: _,
+                } => {
+                    if keys.mod_state().intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD) {
+                        (x, y) = (y, x);
+                    }
+                    scroll.0 = (scroll.0 + x * sensitivity).max(0);
+                    scroll.1 = (scroll.1 - y * sensitivity).max(0);
+                    Dirty::Visual
+                }
+                _ => Dirty::No,
+            } + dirty;
         }
         framecount = (framecount + 1) % 60;
         // println!("{framecount}");
-        if dirty {
+        if dirty != Dirty::No {
             dbg!(cursor);
-            data.recompute();
+            if dirty == Dirty::Recompute {
+                data.recompute();
+            }
 
             canvas.set_draw_color(WHITE);
             canvas.clear();
+
+            let cell_scroll_x = scroll.0 / cellw;
+            let cell_scroll_y = scroll.1.div_ceil(cellh);
 
             let h34 = (height - top) as i32;
             canvas.set_draw_color(BLACK);
@@ -473,7 +680,7 @@ fn main() {
                 canvas
                     .fill_rect(Rect::new(
                         0,
-                        i * cellh + top - border / 2,
+                        (i + cell_scroll_y) * cellh - scroll.1 + top - border / 2,
                         width.try_into().unwrap(),
                         border.try_into().unwrap(),
                     ))
@@ -483,7 +690,7 @@ fn main() {
                 // vertical lines
                 canvas
                     .fill_rect(Rect::new(
-                        i * cellw - border / 2,
+                        (i + cell_scroll_x) * cellw - scroll.0 - border / 2,
                         top,
                         border.try_into().unwrap(),
                         h34.try_into().unwrap(),
@@ -493,6 +700,7 @@ fn main() {
 
             for x in 0..=(width / cellw) {
                 for y in 0..=(h34 / cellh) {
+                    let (x, y) = (x + cell_scroll_x, y + cell_scroll_y);
                     let Ok(s) = data.get(&(x, y)) else {
                         continue;
                     };
@@ -515,8 +723,8 @@ fn main() {
                                     (copyh).min(sm.height),
                                 )),
                                 Some(Rect::new(
-                                    x * cellw,
-                                    top + y * cellh,
+                                    x * cellw - scroll.0,
+                                    top + y * cellh - scroll.1,
                                     (copyw).min(sm.width),
                                     (copyh).min(sm.height),
                                 )),
@@ -553,7 +761,7 @@ fn main() {
                         .render(if cursor.is_some() {
                             &s.val
                         } else {
-                            s.display.as_ref().unwrap()
+                            s.display.as_ref().map(|x| x as &str).unwrap_or("")
                         })
                         .solid(BLACK)
                     {
@@ -569,14 +777,15 @@ fn main() {
                                 cellh,
                                 top,
                                 sm.width.checked_sub(cellw as u32).map(|x| x + 4),
+                                scroll,
                             );
                             canvas
                                 .copy(
                                     &text_text,
                                     None,
                                     Some(Rect::new(
-                                        x * cellw + border / 2,
-                                        y * cellh + border / 2 + top,
+                                        x * cellw - scroll.0 + border / 2,
+                                        y * cellh - scroll.1 + border / 2 + top,
                                         sm.width,
                                         cellh.try_into().unwrap(),
                                     )),
@@ -584,20 +793,29 @@ fn main() {
                                 .unwrap();
                         }
                         Err(_) => {
-                            select_box(&mut canvas, x, cellw, border, y, cellh, top, None);
+                            select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
                         }
                     }
                 } else {
-                    select_box(&mut canvas, x, cellw, border, y, cellh, top, None);
+                    select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
                 }
             }
 
             if let Some(cpos) = cursor {
+                let cpos = if let Some(formc) = form_select_cursor.clone() {
+                    formc.end
+                } else {
+                    cpos
+                };
                 canvas.set_draw_color(BLACK);
                 if let Ok(s) = data.get(&selected.unwrap()) {
                     canvas
                         .draw_rect(Rect::new(
-                            mainfont.size_of(&s.val[0..cpos]).unwrap().0 as i32 - border / 2,
+                            mainfont
+                                .size_of(&s.val[0..(cpos.min(s.val.len()))]) // TODO this shouldnt happen, fix it
+                                .unwrap()
+                                .0 as i32
+                                - border / 2,
                             menu + border / 2,
                             border as u32,
                             (top - menu - border / 2) as u32,
@@ -649,14 +867,18 @@ fn select_box(
     cellh: i32,
     top: i32,
     boxw: Option<u32>,
+    scroll: (i32, i32),
 ) {
-    canvas.set_draw_color(BLUE);
-    canvas
-        .fill_rect(Rect::new(
-            x * cellw + border / 2,
-            y * cellh + border / 2 + top,
-            (cellw - border) as u32 + boxw.unwrap_or(0),
-            (cellh - border) as u32,
-        ))
-        .unwrap();
+    let yoff = y * cellh - scroll.1 + border / 2 + top;
+    if yoff > top {
+        canvas.set_draw_color(BLUE);
+        canvas
+            .fill_rect(Rect::new(
+                x * cellw - scroll.0 + border / 2,
+                yoff,
+                (cellw - border) as u32 + boxw.unwrap_or(0),
+                (cellh - border) as u32,
+            ))
+            .unwrap();
+    }
 }
