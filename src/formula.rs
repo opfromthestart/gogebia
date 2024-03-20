@@ -185,6 +185,21 @@ impl FromStr for Const {
         }
     }
 }
+impl TryInto<Bound> for &Const {
+    type Error = Const;
+
+    fn try_into(self) -> Result<Bound, <Self as TryInto<Bound>>::Error> {
+        match self {
+            Const::Error(CellError::InvalidInfinity { cell, cursor }) => Ok(Bound::Inf),
+            Const::Num(n) => Ok(Bound::Fin(*n as i32)),
+            _ => Err(Const::Error(CellError::BadArgument {
+                cell: None,
+                cursor: 0,
+                expected_types: vec!["Number".into(), ".I".into()],
+            })),
+        }
+    }
+}
 
 impl Const {
     fn into_pos(self, pos: SLoc) -> Self {
@@ -381,57 +396,157 @@ fn form_tree_basic<'a>(tokens: Vec<(&'a str, usize)>) -> Value {
     }
 }
 
-fn split_parens<'a, 'b>(
-    tokens: &'b [(&'a str, usize)],
-) -> Result<Vec<&'b [(&'a str, usize)]>, Value> {
-    let mut split_parens = vec![];
-    let mut pcount = 0;
-    let mut start = 0;
-    let mut has_parens = false;
-    for (i, t) in tokens.iter().enumerate() {
-        if t.0 == "(" {
-            pcount += 1;
-            has_parens = true;
-        }
-        if t.0 == ")" {
-            pcount -= 1;
-        }
-        if pcount < 0 {
-            return Err(Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: t.1,
-                reason: "Ending parenthesis with no opening",
-            })));
-        }
-        if pcount == 0 {
-            if has_parens {
-                split_parens.push(&tokens[start + 1..i]);
-                has_parens = false;
-            } else {
-                split_parens.push(&tokens[start..=i]);
-            }
-            start = i + 1;
+#[derive(Debug, Clone)]
+enum ParenTree<'a> {
+    Paren(Vec<Box<ParenTree<'a>>>),
+    Token(&'a str, usize),
+}
+
+impl<'a> ParenTree<'a> {
+    fn len(&self) -> usize {
+        match self {
+            ParenTree::Paren(p) => p.iter().map(|p| p.len()).sum(),
+            ParenTree::Token(_, _) => 1,
         }
     }
-    if pcount != 0 {
-        Err(Value::Const(Const::Error(CellError::InvalidFormula {
-            cell: None,
-            cursor: tokens.last().unwrap().1,
-            reason: "Missing closing parenthesis",
-        })))
+
+    fn is_func(&self) -> bool {
+        match self {
+            ParenTree::Paren(_) => false,
+            ParenTree::Token(t, _) => t.chars().all(char::is_alphabetic),
+        }
+    }
+    fn is_op(&self) -> bool {
+        match self {
+            ParenTree::Paren(_) => false,
+            ParenTree::Token(t, _) => t.chars().all(|c| !c.is_alphanumeric()),
+        }
+    }
+    fn is_comma(&self) -> bool {
+        // dbg!(self);
+        match self {
+            ParenTree::Token(",", _) => true,
+            _ => false,
+        }
+    }
+    fn is_mul_args(&self) -> bool {
+        match self {
+            ParenTree::Paren(p) => p.iter().skip(1).step_by(2).any(|t| dbg!(t).is_comma()),
+            ParenTree::Token(_, _) => false,
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = ParenTree<'a>> {
+        match self {
+            ParenTree::Paren(p) => p
+                .iter()
+                .flat_map(|p| p.iter())
+                .collect::<Vec<_>>()
+                .into_iter(),
+            ParenTree::Token(_, _) => vec![self.clone()].into_iter(),
+        }
+    }
+    fn as_op(&self) -> Option<char> {
+        match self {
+            ParenTree::Paren(_) => None,
+            ParenTree::Token(t, _) => {
+                if self.is_op() {
+                    t.chars().next()
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    fn as_func(&self) -> Option<&'a str> {
+        match self {
+            ParenTree::Paren(_) => None,
+            ParenTree::Token(t, _) => {
+                if self.is_func() {
+                    Some(t)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    fn get(&self, i: usize) -> Option<(&'a str, usize)> {
+        match self {
+            ParenTree::Paren(p) => p.get(i).and_then(|p| p.get(0)),
+            ParenTree::Token(t, id) => {
+                if i == 0 {
+                    Some((t, *id))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+enum ParenIter<'a> {
+    Token(std::vec::IntoIter<ParenTree<'a>>),
+}
+impl<'a> Iterator for ParenIter<'a> {
+    type Item = ParenTree<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            ParenIter::Token(t) => t.next(),
+        }
+    }
+}
+
+fn split_parens<'a, 'b>(tokens: &'b [(&'a str, usize)]) -> Result<ParenTree<'a>, Value> {
+    let mut split_par_vec = vec![];
+    let mut pcount = 0;
+    let mut start = 0;
+    println!("{tokens:?} tokens");
+    if tokens.len() == 1 {
+        Ok(ParenTree::Token(tokens[0].0, tokens[0].1))
     } else {
-        Ok(split_parens)
+        let mut pstart = None;
+        for (i, t) in tokens.iter().enumerate() {
+            if t.0 == "(" {
+                if pcount == 0 {
+                    pstart = Some(i);
+                }
+                pcount += 1;
+            }
+            if t.0 == ")" {
+                pcount -= 1;
+            }
+            if pcount < 0 {
+                return Err(Value::Const(Const::Error(CellError::InvalidFormula {
+                    cell: None,
+                    cursor: t.1,
+                    reason: "Ending parenthesis with no opening",
+                })));
+            }
+            if pcount == 0 {
+                if let Some(ps) = pstart {
+                    split_par_vec.push(Box::new(split_parens(&tokens[ps + 1..i])?));
+                    pstart = None;
+                } else {
+                    split_par_vec.push(Box::new(split_parens(&tokens[start..=i])?));
+                }
+                start = i + 1;
+            }
+        }
+        if pcount != 0 {
+            Err(Value::Const(Const::Error(CellError::InvalidFormula {
+                cell: None,
+                cursor: tokens.last().unwrap().1,
+                reason: "Missing closing parenthesis",
+            })))
+        } else {
+            Ok(ParenTree::Paren(split_par_vec))
+        }
     }
 }
 
 // TODO functions with no arguments
 // TODO parse ranges of cells
-fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
-    let split_parens = match split_parens(&tokens) {
-        Ok(v) => v,
-        Err(e) => return (e, false),
-    };
-    if split_parens.len() == 0 {
+fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
+    if split_par.len() == 0 {
         return (
             Value::Const(Const::Error(CellError::InvalidFormula {
                 cell: None,
@@ -441,40 +556,42 @@ fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
             false,
         );
     }
-    if split_parens.len() == 1 {
-        let sp = split_parens[0];
-        return if sp[0].0 == "(" {
-            (form_tree(&sp[1..sp.len() - 1]).0, true)
-        } else if let Some(r) = is_ref(sp[0].0) {
+    dbg!(&split_par);
+    if let ParenTree::Token(sp, i) = split_par {
+        return if let Some(r) = is_ref(sp) {
             (Value::Ref(r), false)
-        } else if let Some(c) = is_const(sp[0].0) {
+        } else if let Some(c) = is_const(sp) {
             (Value::Const(c), false)
-        } else if let Some(s) = is_spec(sp[0].0) {
+        } else if let Some(s) = is_spec(sp) {
             (Value::Special(s), false)
-        } else if let Some(r) = is_range(sp[0].0) {
+        } else if let Some(r) = is_range(sp) {
             (Value::Const(Const::Range(r)), false)
         } else {
+            dbg!(sp);
             (
                 Value::Const(Const::Error(CellError::InvalidFormula {
                     cell: None,
-                    cursor: sp[0].1,
+                    cursor: *i,
                     reason: "Couldn't parse token",
                 })),
                 false,
             )
         };
     }
-    // dbg!(&split_parens);
+    let ParenTree::Paren(split_v) = &split_par else {
+        panic!("Other case already checked");
+    };
+    // dbg!(&split_par);
     enum Category {
         Value,
         Operand,
         Function,
     }
 
-    let cats = split_parens.iter().map(|s| {
-        if s[0].0.chars().all(|x| x.is_alphabetic()) {
+    let cats = split_v.iter().map(|s| {
+        if s.is_func() {
             Category::Function
-        } else if s[0].0.len() == 1 && !s[0].0.chars().next().unwrap().is_alphanumeric() {
+        } else if s.is_op() {
             Category::Operand
         } else {
             Category::Value
@@ -488,26 +605,41 @@ fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
         Function(&'a str),
     }
 
-    let mut parseds = split_parens
+    let mut parseds = split_v
         .iter()
         .zip(cats)
         .map(|(v, c)| match c {
             Category::Value => {
-                if v.iter().any(|c| c.0 == ",") {
-                    CatParsed::Args(v.split(|s| s.0 == ",").map(|v| form_tree(v).0).collect())
+                if v.is_mul_args() {
+                    // TODO dont do whatever it is here, need to fox split_parens
+                    let vargs: Vec<_> = v.iter().collect();
+
+                    CatParsed::Args(
+                        vargs
+                            .split(|varg| varg.is_comma())
+                            .map(|varg| {
+                                dbg!(form_tree(&ParenTree::Paren(
+                                    varg.iter().map(|x| Box::new(x.clone())).collect(),
+                                )))
+                                .0
+                            })
+                            .collect(),
+                    )
                 } else {
-                    CatParsed::Value(form_tree(v))
+                    println!("As val");
+                    CatParsed::Value(form_tree(&v))
                 }
             }
-            Category::Operand => CatParsed::Operand(v[0].0.chars().next().unwrap()),
-            Category::Function => CatParsed::Function(v[0].0),
+            Category::Operand => CatParsed::Operand(v.as_op().unwrap()),
+            Category::Function => CatParsed::Function(v.as_func().unwrap()),
         })
         .peekable();
 
-    // let p2 = parseds.clone();
+    // let p2 = parseds.cloned();
     // for e in p2 {
     //     dbg!(e);
     // }
+    // dbg!(&parseds);
 
     // Resolve function calls
     let mut token_orchard = vec![];
@@ -516,7 +648,7 @@ fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
         // let e = dbg!(parseds.next().expect("Had to be some"));
         let e = parseds.next().expect("Had to be some");
         if let CatParsed::Function(name) = e {
-            let lp = split_parens[i].last().unwrap();
+            let lp = split_par.get(i).unwrap();
             let Some(args) = parseds.next() else {
                 return (
                     Value::Const(Const::Error(CellError::InvalidFormula {
@@ -554,7 +686,7 @@ fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
                 lp.1,
             ));
         } else if let CatParsed::Args(_) = e {
-            let lp = split_parens[i].last().unwrap();
+            let lp = split_par.get(i).unwrap();
             return (
                 Value::Const(Const::Error(CellError::InvalidFormula {
                     cell: None,
@@ -564,7 +696,7 @@ fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
                 false,
             );
         } else {
-            token_orchard.push((e, split_parens[i].last().unwrap().1));
+            token_orchard.push((e, split_par.get(i).unwrap().1));
         }
         i += 1;
     }
@@ -792,6 +924,14 @@ fn form_tree<'a>(tokens: &[(&'a str, usize)]) -> (Value, bool) {
     (ret, false)
 }
 
+fn letters_to_row(token: &str) -> Option<i32> {
+    let mut s = 0;
+    for c in token.chars() {
+        s = s * 26 + (c.to_digit(36)? - 9);
+    }
+    Some((s - 1) as i32)
+}
+
 fn is_ref(token: &str) -> Option<SLoc> {
     if !token.chars().next().is_some_and(|c| c.is_alphabetic()) {
         None
@@ -821,14 +961,18 @@ fn is_ref(token: &str) -> Option<SLoc> {
 }
 
 pub(crate) fn show_ref(loc: &SLoc) -> String {
+    format!("{}{}", show_col(loc.0), loc.1 + 1)
+}
+
+pub(crate) fn show_col(x: i32) -> String {
     let mut c = String::new();
-    let mut cn = loc.0 + 1;
+    let mut cn = x + 1;
     while cn > 0 {
         c.insert(0, (('A' as u8) + ((cn - 1) as u8) % 26) as char);
         // TODO this probably doesnt work
         cn = (cn - 1) / 26;
     }
-    format!("{}{}", c, loc.1 + 1)
+    c
 }
 
 fn is_const(token: &str) -> Option<Const> {
@@ -848,6 +992,13 @@ fn is_range(token: &str) -> Option<Range> {
     if let Some(nx) = split.next() {
         if &nx == &"" {
             Some(Range::range_inf(start))
+        } else if let Ok(n) = nx.parse::<i32>() {
+            Some(Range(start, SLocBound(Bound::Inf, Bound::Fin(n - 1))))
+        } else if nx.chars().all(char::is_alphabetic) {
+            Some(Range(
+                start,
+                SLocBound(Bound::Fin(letters_to_row(nx)?), Bound::Inf),
+            ))
         } else {
             let end = is_ref(nx)?;
             if split.next().is_some() {
@@ -888,7 +1039,11 @@ impl FromStr for Value {
                 // dbg!(&s[1..]);
                 let tokens = form_tokens(&s[1..]);
                 // dbg!(&tokens);
-                Ok(form_tree(&tokens).0)
+                let Ok(split) = split_parens(&tokens) else {
+                    let _ = dbg!(split_parens(&tokens));
+                    return Err("Couldnt parenthesize");
+                };
+                Ok(form_tree(&split).0)
             } else {
                 Ok(Self::Const(Const::Error(CellError::InvalidFormula {
                     cell: None,
@@ -1350,7 +1505,14 @@ impl Sheet {
                 // This needs to continue to properly do reference loop detection and proper text updating, so I cant early return/continue
                 let val = if let Ok(s) = s {
                     let val = s.val.clone();
-                    val.parse::<Value>().unwrap()
+                    match val.parse::<Value>() {
+                        Ok(val) => val,
+                        Err(e) => Value::Const(Const::Error(CellError::InvalidFormula {
+                            cell: Some(pos),
+                            cursor: 0,
+                            reason: e,
+                        })),
+                    }
                 } else {
                     Value::Const(Const::Error(s.unwrap_err()))
                 };
@@ -1515,33 +1677,18 @@ impl Function for Sum {
         for a in args {
             if let Value::Const(Const::Range(r)) = a {
                 // dbg!(data);
-                for elem in data.keys().filter(|k| r.in_range(k)) {
-                    // dbg!(&elem);
-                    let v = (&data).get(&elem, &eval);
-                    let v = match v {
-                        Ok(v) => v,
-                        Err(e) => match e {
-                            CellError::MissingCell { cell: _ } => continue,
-                            _ => return Const::Error(e),
-                        },
-                    };
-                    // dbg!(v);
-                    let Ok(v) = v.val.parse::<Value>() else {
-                        return Const::Error(CellError::MissingCell { cell: Some(*elem) });
-                    };
-                    let new_spec = spec.clone().with_sloc(*elem);
-                    // dbg!(&new_spec);
-                    let cv = v.eval(data, eval, func, &new_spec);
-                    if let Const::Num(n) = cv.as_ref() {
-                        s += n;
-                    } else if let Const::Error(err) = cv.as_ref() {
-                        return Const::Error(err.clone());
-                    }
+                if let Some(value) = sum_range(data, r, eval, spec, func, &mut s) {
+                    return value;
                 }
             } else {
                 let c = a.eval(data, eval, func, spec);
+                dbg!(&c);
                 if let Const::Num(n) = c.as_ref() {
                     s += n;
+                } else if let Const::Range(r) = c.as_ref() {
+                    if let Some(value) = sum_range(data, r, eval, spec, func, &mut s) {
+                        return value;
+                    }
                 } else {
                     return e;
                 }
@@ -1571,6 +1718,40 @@ impl Function for Sum {
         }));
         refs
     }
+}
+
+fn sum_range(
+    data: &SheetData,
+    r: &Range,
+    eval: &mut std::collections::BTreeMap<(i32, i32), usize>,
+    spec: &SpecValues,
+    func: &SheetFunc,
+    s: &mut f64,
+) -> Option<Const> {
+    for elem in data.keys().filter(|k| r.in_range(k)) {
+        // dbg!(&elem);
+        let v = (&data).get(&elem, &eval);
+        let v = match v {
+            Ok(v) => v,
+            Err(e) => match e {
+                CellError::MissingCell { cell: _ } => continue,
+                _ => return Some(Const::Error(e)),
+            },
+        };
+        // dbg!(v);
+        let Ok(v) = v.val.parse::<Value>() else {
+            return Some(Const::Error(CellError::MissingCell { cell: Some(*elem) }));
+        };
+        let new_spec = spec.clone().with_sloc(*elem);
+        // dbg!(&new_spec);
+        let cv = v.eval(data, eval, func, &new_spec);
+        if let Const::Num(n) = cv.as_ref() {
+            *s += n;
+        } else if let Const::Error(err) = cv.as_ref() {
+            return Some(Const::Error(err.clone()));
+        }
+    }
+    None
 }
 #[derive(Default)]
 pub(crate) struct ValueFunc;
@@ -1761,7 +1942,7 @@ impl Function for CountIf {
 }
 
 #[derive(Default)]
-struct RangeFunc;
+pub(crate) struct RangeFunc;
 impl Function for RangeFunc {
     fn get_refs(
         &self,
@@ -1793,6 +1974,29 @@ impl Function for RangeFunc {
             refs.push((&(c, r)).into());
             refs
         } else if let [c1, r1, c2, r2] = args {
+            let c1 = c1.eval(data, eval, func, spec);
+            let Const::Num(c1) = c1.as_ref() else {
+                return refs;
+            };
+            let r1 = r1.eval(data, eval, func, spec);
+            let Const::Num(r1) = r1.as_ref() else {
+                return refs;
+            };
+            // TODO make this more rigid, find good way to do a let else
+            if c1 < &0. || c1 != &c1.round() || r1 < &0. || &r1.round() != r1 {
+                return refs;
+            }
+            let c1 = *c1 as i32;
+            let r1 = *r1 as i32;
+            let c2 = c2.eval(data, eval, func, spec);
+            let Ok(c2) = TryInto::<Bound>::try_into(c2.as_ref()) else {
+                return refs;
+            };
+            let r2 = r2.eval(data, eval, func, spec);
+            let Ok(r2) = TryInto::<Bound>::try_into(r2.as_ref()) else {
+                return refs;
+            };
+            refs.push(Range((c1, r1), SLocBound(c2, r2)));
             refs
         } else {
             refs
@@ -1811,6 +2015,78 @@ impl Function for RangeFunc {
         func: &SheetFunc,
         spec: &SpecValues,
     ) -> Const {
-        todo!()
+        if let [c, r] = args {
+            let c = c.eval(data, eval, func, spec);
+            let Const::Num(c) = c.as_ref() else {
+                return Const::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    expected_types: vec!["Number".into()],
+                });
+            };
+            let r = r.eval(data, eval, func, spec);
+            let Const::Num(r) = r.as_ref() else {
+                return Const::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 1,
+                    expected_types: vec!["Number".into()],
+                });
+            };
+            // TODO make this more rigid, find good way to do a let else
+            if c < &0. || c != &c.round() || r < &0. || &r.round() != r {
+                return Const::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    expected_types: vec!["Whole number".into()],
+                });
+            }
+            let c = *c as i32;
+            let r = *r as i32;
+            Const::Range(Range::range_inf((c, r)))
+        } else if let [c1, r1, c2, r2] = args {
+            let c1 = c1.eval(data, eval, func, spec);
+            let Const::Num(c1) = c1.as_ref() else {
+                return Const::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    expected_types: vec!["Number".into()],
+                });
+            };
+            let r1 = r1.eval(data, eval, func, spec);
+            let Const::Num(r1) = r1.as_ref() else {
+                return Const::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 1,
+                    expected_types: vec!["Number".into()],
+                });
+            };
+            // TODO make this more rigid, find good way to do a let else
+            if c1 < &0. || c1 != &c1.round() || r1 < &0. || &r1.round() != r1 {
+                return Const::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    expected_types: vec!["Whole number".into()],
+                });
+            }
+            let c1 = *c1 as i32;
+            let r1 = *r1 as i32;
+            let c2 = c2.eval(data, eval, func, spec);
+            let c2 = match TryInto::<Bound>::try_into(c2.as_ref()) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let r2 = r2.eval(data, eval, func, spec);
+            let r2 = match TryInto::<Bound>::try_into(r2.as_ref()) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            Const::Range(Range((c1, r1), SLocBound(c2, r2)))
+        } else {
+            Const::Error(CellError::WrongNumArguments {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                arguments: vec![2, 4],
+            })
+        }
     }
 }

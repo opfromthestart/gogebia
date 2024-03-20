@@ -19,6 +19,8 @@ use sdl2::{
     ttf,
 };
 
+use crate::formula::show_col;
+
 const BLACK: Color = Color::RGB(20, 20, 20);
 const BLUE: Color = Color::RGB(90, 90, 180);
 const WHITE: Color = Color::RGB(200, 200, 200);
@@ -228,8 +230,8 @@ color function sets cell color
 =color(value(.C-1, .R), .F.<0, .HRed, .HGreen) last one is default
 =color(form, .HYellow) always makes it yellow
 
-Cell and range insertions into a formula by click, drag
-scrolling
+Cell and range insertions into a formula by click, drag -- I think done
+scrolling -- Probably done
 zoom
 
 menu
@@ -294,6 +296,7 @@ fn main() {
     let mut scroll = (0, 0);
     // let mut shifted = false;
     let sensitivity = cellh / 3;
+    // let sensitivity = 1;
 
     let sdlttf = ttf::init().unwrap();
     let mainfont = sdlttf.load_font("UbuntuMono-Regular.ttf", 48).unwrap();
@@ -311,6 +314,7 @@ fn main() {
     data.2.add_func::<formula::Sum>();
     data.2.add_func::<formula::ValueFunc>();
     data.2.add_func::<formula::CountIf>();
+    data.2.add_func::<formula::RangeFunc>();
     let mut cursor = None;
     let mut form_select_start = None;
     let mut form_select_end = None;
@@ -371,7 +375,11 @@ fn main() {
                     x,
                     y,
                 } => {
-                    let new = (((x + scroll.0) / cellw), ((y + scroll.1) - top) / cellh);
+                    println!("{} {}", x / cellw, (y - top) / cellh);
+                    let new = (
+                        ((x + scroll.0) / cellw - 1),
+                        ((y + scroll.1) - top) / cellh - 1,
+                    );
                     if y < top {
                         // TODO menu and clicking into formula
                         Dirty::No
@@ -394,12 +402,15 @@ fn main() {
                                 Dirty::No
                             }
                         } else {
-                            let t = if y < top || selected == Some(new) {
+                            let t = if selected == Some(new) {
+                                println!("1");
                                 Dirty::No
                             } else if new.0 >= 0 && new.1 >= 0 {
+                                println!("2");
                                 selected = Some(new);
                                 Dirty::Visual
                             } else {
+                                println!("3");
                                 selected = None;
                                 cursor = None;
                                 Dirty::Visual
@@ -510,11 +521,17 @@ fn main() {
                                 Dirty::Recompute
                             } else if key == Keycode::Down {
                                 selected = Some((x, y + 1));
+                                let r = if cursor.is_some() {
+                                    Dirty::Recompute
+                                } else {
+                                    Dirty::Visual
+                                };
                                 cursor = None;
-                                if (y + 2) * cellh >= height - top + scroll.1 {
-                                    scroll.1 = (y + 2 - (height - top) / cellh) * cellh;
+                                if (y + 3) * cellh >= height - top + scroll.1 {
+                                    scroll.1 = (y + 3 - (height - top) / cellh) * cellh;
                                 }
-                                Dirty::Visual
+                                let _ = data.dirty(&(x, y));
+                                r
                             } else if key == Keycode::Left {
                                 if let Some(cpos) = cursor {
                                     if cpos == 0 {
@@ -552,8 +569,8 @@ fn main() {
                                     }
                                 } else {
                                     selected = Some((x + 1, y));
-                                    if (x + 2) * cellw > width + scroll.0 {
-                                        scroll.0 = (x + 2 - width / cellw) * cellw;
+                                    if (x + 3) * cellw > width + scroll.0 {
+                                        scroll.0 = (x + 3 - width / cellw) * cellw;
                                     }
                                     Dirty::Visual
                                 }
@@ -671,11 +688,27 @@ fn main() {
             canvas.clear();
 
             let cell_scroll_x = scroll.0 / cellw;
-            let cell_scroll_y = scroll.1.div_ceil(cellh);
+            let cell_scroll_y = scroll.1 / cellh;
 
             let h34 = (height - top) as i32;
             canvas.set_draw_color(BLACK);
-            for i in 0..=(h34 / cellh) {
+            canvas
+                .fill_rect(Rect::new(
+                    0,
+                    top - border / 2,
+                    width.try_into().unwrap(),
+                    border.try_into().unwrap(),
+                ))
+                .unwrap();
+            canvas
+                .fill_rect(Rect::new(
+                    0,
+                    top + cellh - border / 2,
+                    width.try_into().unwrap(),
+                    border.try_into().unwrap(),
+                ))
+                .unwrap();
+            for i in 2..=(h34 / cellh) {
                 // horizontal lines
                 canvas
                     .fill_rect(Rect::new(
@@ -686,7 +719,15 @@ fn main() {
                     ))
                     .unwrap();
             }
-            for i in 0..=(width / cellw) {
+            canvas
+                .fill_rect(Rect::new(
+                    cellw - border / 2,
+                    top,
+                    border.try_into().unwrap(),
+                    h34.try_into().unwrap(),
+                ))
+                .unwrap();
+            for i in 2..=(width / cellw) {
                 // vertical lines
                 canvas
                     .fill_rect(Rect::new(
@@ -700,14 +741,11 @@ fn main() {
 
             for x in 0..=(width / cellw) {
                 for y in 0..=(h34 / cellh) {
-                    let (x, y) = (x + cell_scroll_x, y + cell_scroll_y);
-                    let Ok(s) = data.get(&(x, y)) else {
+                    let (xs, ys) = (x + cell_scroll_x - 1, y + cell_scroll_y - 1);
+                    if x == 0 && y == 0 {
                         continue;
-                    };
-                    if s.display.is_some() && Some((x, y)) != selected {
-                        let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
-                        else {
-                            // If empty string
+                    } else if x == 0 {
+                        let Ok(text) = cellfont.render(&show_col(ys)).solid(BLACK) else {
                             continue;
                         };
                         let text_text = texturer.create_texture_from_surface(text).unwrap();
@@ -723,10 +761,87 @@ fn main() {
                                     (copyh).min(sm.height),
                                 )),
                                 Some(Rect::new(
-                                    x * cellw - scroll.0,
-                                    top + y * cellh - scroll.1,
+                                    (x) * cellw,
+                                    top + (y) * cellh - scroll.1.rem_euclid(cellh),
                                     (copyw).min(sm.width),
                                     (copyh).min(sm.height),
+                                )),
+                            )
+                            .unwrap();
+                        continue;
+                    } else if y == 0 {
+                        let Ok(text) = cellfont.render(&format!("{}", xs + 1)).solid(BLACK) else {
+                            continue;
+                        };
+                        let text_text = texturer.create_texture_from_surface(text).unwrap();
+                        let sm = text_text.query();
+                        let (copyw, copyh) = { (cellw as u32, cellh as u32) };
+                        canvas
+                            .copy(
+                                &text_text,
+                                Some(Rect::new(
+                                    0,
+                                    0,
+                                    (copyw).min(sm.width),
+                                    (copyh).min(sm.height),
+                                )),
+                                Some(Rect::new(
+                                    ((x) * cellw - scroll.0.rem_euclid(cellw)).max(cellw),
+                                    top + (y) * cellh,
+                                    (copyw).min(sm.width),
+                                    (copyh).min(sm.height),
+                                )),
+                            )
+                            .unwrap();
+                        continue;
+                    }
+                    let Ok(s) = data.get(&(xs, ys)) else {
+                        continue;
+                    };
+                    if s.display.is_some() && Some((xs, ys)) != selected {
+                        let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
+                        else {
+                            // If empty string
+                            continue;
+                        };
+                        let text_text = texturer.create_texture_from_surface(text).unwrap();
+                        let sm = text_text.query();
+                        let (copyw, copyh) = { (cellw as u32, cellh as u32) };
+                        canvas
+                            .copy(
+                                &text_text,
+                                Some(Rect::new(
+                                    0,
+                                    0,
+                                    (copyw).min(sm.width).min(if x == 1 {
+                                        (cellw - scroll.0.rem_euclid(cellw)) as u32
+                                    } else {
+                                        u32::MAX
+                                    }),
+                                    (copyh).min(sm.height).min(if y == 1 {
+                                        (cellh - scroll.1.rem_euclid(cellh)) as u32
+                                    } else {
+                                        u32::MAX
+                                    }),
+                                )),
+                                Some(Rect::new(
+                                    ((x) * cellw - scroll.0.rem_euclid(cellw)).max(cellw),
+                                    top + (y) * cellh
+                                        - if y == 1 {
+                                            0
+                                        } else {
+                                            scroll.1.rem_euclid(cellh)
+                                        },
+                                    (copyw).min(sm.width).min(if x == 1 {
+                                        (cellw - scroll.0.rem_euclid(cellw)) as u32
+                                    } else {
+                                        u32::MAX
+                                    }),
+                                    (copyh).min(sm.height).min(if y == 1 {
+                                        (cellh - scroll.1.rem_euclid(cellh)) as u32
+                                    } else {
+                                        u32::MAX
+                                    }),
                                 )),
                             )
                             .unwrap();
@@ -784,8 +899,8 @@ fn main() {
                                     &text_text,
                                     None,
                                     Some(Rect::new(
-                                        x * cellw - scroll.0 + border / 2,
-                                        y * cellh - scroll.1 + border / 2 + top,
+                                        (x + 1) * cellw - scroll.0 + border / 2,
+                                        (y + 1) * cellh - scroll.1 + border / 2 + top,
                                         sm.width,
                                         cellh.try_into().unwrap(),
                                     )),
@@ -874,8 +989,8 @@ fn select_box(
         canvas.set_draw_color(BLUE);
         canvas
             .fill_rect(Rect::new(
-                x * cellw - scroll.0 + border / 2,
-                yoff,
+                (x + 1) * cellw - scroll.0 + border / 2,
+                yoff + cellh,
                 (cellw - border) as u32 + boxw.unwrap_or(0),
                 (cellh - border) as u32,
             ))
