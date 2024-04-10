@@ -233,6 +233,7 @@ color function sets cell color
 Cell and range insertions into a formula by click, drag -- I think done
 scrolling -- Probably done
 zoom
+resizing rows and columns
 
 menu
 file picker (rfd)

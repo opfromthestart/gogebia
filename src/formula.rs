@@ -3,7 +3,7 @@ use std::{borrow::Cow, collections::HashSet, rc::Rc, str::FromStr};
 use crate::{SLoc, Sheet, SheetData, SheetEval, SheetFunc};
 
 #[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Spec {
     dd,
     dC,
@@ -15,6 +15,7 @@ pub(crate) enum Spec {
     dFC,
     dFR,
     dI,
+    dH(u8, u8, u8),
 }
 #[derive(Clone, Debug)]
 pub(crate) struct SpecValues {
@@ -154,6 +155,7 @@ pub(crate) enum Const {
     Bool(bool),
     Error(CellError),
     Range(Range),
+    Color(u8, u8, u8),
 }
 
 impl Into<String> for &Const {
@@ -164,6 +166,7 @@ impl Into<String> for &Const {
             Const::Bool(b) => format!("{b}"),
             Const::Error(e) => format!("{e:?}"),
             Const::Range(_) => format!("Range is not valid here"),
+            Const::Color(r, g, b) => format!("Color #{r},{g},{b}"),
         }
     }
 }
@@ -176,12 +179,18 @@ impl FromStr for Const {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
         if let Ok(b) = s.parse() {
             Ok(Self::Bool(b))
         } else if let Ok(n) = s.parse() {
             Ok(Self::Num(n))
+        } else if s.len() > 1
+            && s.chars().next().is_some_and(|c| c == '"')
+            && s.chars().last().is_some_and(|c| c == '"')
+        {
+            Ok(Self::String(s[1..s.len() - 1].to_owned()))
         } else {
-            Ok(Self::String(s.to_owned()))
+            Err(())
         }
     }
 }
@@ -190,7 +199,7 @@ impl TryInto<Bound> for &Const {
 
     fn try_into(self) -> Result<Bound, <Self as TryInto<Bound>>::Error> {
         match self {
-            Const::Error(CellError::InvalidInfinity { cell, cursor }) => Ok(Bound::Inf),
+            Const::Error(CellError::InvalidInfinity { cell: _, cursor: _ }) => Ok(Bound::Inf),
             Const::Num(n) => Ok(Bound::Fin(*n as i32)),
             _ => Err(Const::Error(CellError::BadArgument {
                 cell: None,
@@ -263,7 +272,7 @@ impl Const {
 //     }
 // }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum Value {
     Const(Const),
     Ref(SLoc),
@@ -431,7 +440,7 @@ impl<'a> ParenTree<'a> {
     }
     fn is_mul_args(&self) -> bool {
         match self {
-            ParenTree::Paren(p) => p.iter().skip(1).step_by(2).any(|t| dbg!(t).is_comma()),
+            ParenTree::Paren(p) => p.iter().skip(1).any(|t| dbg!(t).is_comma()),
             ParenTree::Token(_, _) => false,
         }
     }
@@ -482,18 +491,18 @@ impl<'a> ParenTree<'a> {
         }
     }
 }
-enum ParenIter<'a> {
-    Token(std::vec::IntoIter<ParenTree<'a>>),
-}
-impl<'a> Iterator for ParenIter<'a> {
-    type Item = ParenTree<'a>;
+// enum ParenIter<'a> {
+//     Token(std::vec::IntoIter<ParenTree<'a>>),
+// }
+// impl<'a> Iterator for ParenIter<'a> {
+//     type Item = ParenTree<'a>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            ParenIter::Token(t) => t.next(),
-        }
-    }
-}
+//     fn next(&mut self) -> Option<Self::Item> {
+//         match self {
+//             ParenIter::Token(t) => t.next(),
+//         }
+//     }
+// }
 
 fn split_parens<'a, 'b>(tokens: &'b [(&'a str, usize)]) -> Result<ParenTree<'a>, Value> {
     let mut split_par_vec = vec![];
@@ -968,23 +977,14 @@ pub(crate) fn show_col(x: i32) -> String {
     let mut c = String::new();
     let mut cn = x + 1;
     while cn > 0 {
-        c.insert(0, (('A' as u8) + ((cn - 1) as u8) % 26) as char);
-        // TODO this probably doesnt work
+        c.insert(0, (('A' as u8) + ((cn - 1) % 26) as u8) as char);
         cn = (cn - 1) / 26;
     }
     c
 }
 
 fn is_const(token: &str) -> Option<Const> {
-    if token.chars().next() == Some('"') && token.chars().last() == Some('"') {
-        Some(Const::String(token.to_owned()))
-    } else if let Ok(n) = token.parse::<f64>() {
-        Some(Const::Num(n))
-    } else if token == "true" || token == "false" {
-        Some(Const::Bool(token == "true"))
-    } else {
-        None
-    }
+    Const::from_str(token).ok()
 }
 fn is_range(token: &str) -> Option<Range> {
     let mut split = token.split(":");
@@ -1013,15 +1013,36 @@ fn is_range(token: &str) -> Option<Range> {
 }
 fn is_spec(token: &str) -> Option<Spec> {
     match token {
+        // ".." => Some(Spec::dd),
         ".R" => Some(Spec::dR),
         ".C" => Some(Spec::dC),
         ".SR" => Some(Spec::dSR),
         ".SC" => Some(Spec::dSC),
-        ".S." => Some(Spec::dSd),
+        // ".S." => Some(Spec::dSd),
         ".FR" => Some(Spec::dFR),
         ".FC" => Some(Spec::dFC),
         ".I" => Some(Spec::dI),
         ".F." => Some(Spec::dFd),
+        _ if &token[..2] == ".H" => {
+            if token.len() == 8 {
+                if let Ok(n) = i32::from_str_radix(&token[2..], 16) {
+                    Some(Spec::dH(
+                        (n / 65536).try_into().unwrap(),
+                        ((n % 65536) / 256).try_into().unwrap(),
+                        (n % 256).try_into().unwrap(),
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                match &token[2..].to_lowercase() as &str {
+                    "green" => Some(Spec::dH(0, 255, 0)),
+                    "red" => Some(Spec::dH(255, 0, 0)),
+                    "blue" => Some(Spec::dH(0, 0, 255)),
+                    _ => None,
+                }
+            }
+        }
         _ => None,
     }
 }
@@ -1182,6 +1203,7 @@ impl Value {
                         cell: Some(spec.to_sloc()),
                         cursor: 0,
                     })),
+                    Spec::dH(r, g, b) => Cow::Owned(Const::Color(*r, *g, *b)),
                 }
             }
             Value::Mul(lhs, rhs) => {
@@ -2088,5 +2110,187 @@ impl Function for RangeFunc {
                 arguments: vec![2, 4],
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::formula::*;
+
+    #[test]
+    fn const_parse() {
+        assert_eq!(Const::from_str("true"), Ok(Const::Bool(true)));
+        assert_eq!(Const::from_str("7"), Ok(Const::Num(7.0)));
+        assert_eq!(Const::from_str("7.5"), Ok(Const::Num(7.5)));
+        assert_eq!(Const::from_str("-7.5"), Ok(Const::Num(-7.5)));
+        assert_eq!(Const::from_str("-7.5e"), Err(()));
+        assert_eq!(Const::from_str("\"Hi\""), Ok(Const::String("Hi".into())));
+    }
+    #[test]
+    fn range_parse() {
+        assert_eq!(
+            is_range("A1:A1"),
+            Some(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Fin(0))))
+        );
+        assert_eq!(
+            is_range("A1:A5"),
+            Some(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Fin(4))))
+        );
+        assert_eq!(
+            is_range("A1:c5"),
+            Some(Range((0, 0), SLocBound(Bound::Fin(2), Bound::Fin(4))))
+        );
+        assert_eq!(
+            is_range("A1:AA123"),
+            Some(Range((0, 0), SLocBound(Bound::Fin(26), Bound::Fin(122))))
+        );
+        assert_eq!(
+            is_range("A1:ABCZ12345"),
+            Some(Range(
+                (0, 0),
+                SLocBound(Bound::Fin(19031), Bound::Fin(12344))
+            ))
+        );
+        assert_eq!(
+            is_range("A1:"),
+            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Inf)))
+        );
+        assert_eq!(
+            is_range("A1:A"),
+            Some(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
+        );
+    }
+    #[test]
+    fn ref_inv() {
+        let tests = ["A1", "B3", "AA72", "AAA72", "AAZZ99999"];
+        let tests2 = [(0, 0), (1, 3), (26, 26), (57023, 99384)];
+        for t in tests {
+            let forward = is_ref(t).unwrap();
+            let inv = show_ref(&forward);
+            assert_eq!(t, inv);
+        }
+        for t in tests2 {
+            let forward = show_ref(&t);
+            let inv = is_ref(&forward);
+            assert_eq!(Some(t), inv);
+        }
+    }
+    #[test]
+    fn spec_parse() {
+        assert_eq!(is_spec(".."), None);
+        assert_eq!(is_spec(".C"), Some(Spec::dC));
+        assert_eq!(is_spec(".R"), Some(Spec::dR));
+        assert_eq!(is_spec(".F."), Some(Spec::dFd));
+        assert_eq!(is_spec(".FC"), Some(Spec::dFC));
+        assert_eq!(is_spec(".FR"), Some(Spec::dFR));
+        assert_eq!(is_spec(".S."), None);
+        assert_eq!(is_spec(".SC"), Some(Spec::dSC));
+        assert_eq!(is_spec(".SR"), Some(Spec::dSR));
+        assert_eq!(is_spec(".I"), Some(Spec::dI));
+
+        assert_eq!(is_spec(".H00ff00"), Some(Spec::dH(0, 255, 0)));
+        assert_eq!(is_spec(".H00ff000"), None);
+        assert_eq!(is_spec(".H0f"), None);
+        assert_eq!(is_spec(".H00ggff"), None);
+        assert_eq!(is_spec(".HGREEN"), Some(Spec::dH(0, 255, 0)));
+        assert_eq!(is_spec(".Hred"), Some(Spec::dH(255, 0, 0)));
+        assert_eq!(is_spec(".HBlUe"), Some(Spec::dH(0, 0, 255)));
+    }
+    #[test]
+    fn formula_parse() {
+        assert_eq!(
+            form_tree(&split_parens(&form_tokens("78")).unwrap()),
+            (Value::Const(Const::Num(78.)), false),
+        );
+        assert_eq!(
+            form_tree(&split_parens(&form_tokens("A5")).unwrap()),
+            (Value::Ref((0, 4)), false),
+        );
+        assert_eq!(
+            form_tree(&split_parens(&form_tokens("A7+C5+3")).unwrap()),
+            (
+                Value::Add(
+                    Rc::new(Value::Add(
+                        Rc::new(Value::Ref((0, 6))),
+                        Rc::new(Value::Ref((2, 4)))
+                    )),
+                    Rc::new(Value::Const(Const::Num(3.)))
+                ),
+                false
+            ),
+        );
+        assert_eq!(
+            form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap()),
+            (
+                Value::Add(
+                    Rc::new(Value::Const(Const::Num(5.))),
+                    Rc::new(Value::Func {
+                        name: "sum".into(),
+                        args: vec![Value::Const(Const::Range(Range(
+                            (0, 0),
+                            SLocBound(Bound::Fin(0), Bound::Inf)
+                        )))]
+                    })
+                ),
+                false
+            ),
+        );
+        assert_eq!(
+            form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap()),
+            (
+                Value::Add(
+                    Rc::new(Value::Const(Const::Num(5.))),
+                    Rc::new(Value::Func {
+                        name: "sum".into(),
+                        args: vec![Value::Const(Const::Range(Range(
+                            (0, 0),
+                            SLocBound(Bound::Fin(0), Bound::Inf)
+                        )))]
+                    })
+                ),
+                false
+            ),
+        );
+        assert_eq!(
+            form_tree(&split_parens(&form_tokens("range(1,1,5,A3)")).unwrap()),
+            (
+                Value::Func {
+                    name: "range".into(),
+                    args: vec![
+                        Value::Const(Const::Num(1.)),
+                        Value::Const(Const::Num(1.)),
+                        Value::Const(Const::Num(5.)),
+                        Value::Ref((0, 2))
+                    ]
+                },
+                false
+            ),
+        );
+        assert_eq!(
+            form_tree(
+                &split_parens(&dbg!(form_tokens("if(sum(A1:B)<20, 20, \"Small\")"))).unwrap()
+            ),
+            (
+                Value::Func {
+                    name: "if".into(),
+                    args: vec![
+                        Value::Lt(
+                            Rc::new(Value::Func {
+                                name: "sum".into(),
+                                args: vec![Value::Const(Const::Range(Range(
+                                    (0, 0),
+                                    SLocBound(Bound::Fin(1), Bound::Inf)
+                                )))]
+                            }),
+                            Rc::new(Value::Const(Const::Num(20.)))
+                        ),
+                        Value::Const(Const::Num(20.)),
+                        Value::Const(Const::String("Small".into())),
+                        // Value::Const(Const::Num(30.))
+                    ]
+                },
+                false
+            ),
+        );
     }
 }
