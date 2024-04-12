@@ -2,14 +2,14 @@
 mod formula;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ops::{Add, Deref, DerefMut},
     str::FromStr,
     time::Duration,
 };
 
 use flate2::Compression;
-use formula::{show_ref, CellData, CellError, Function};
+use formula::{show_ref, CellData, CellError, CountIf, Function, If, RangeFunc, Sum, ValueFunc};
 use sdl2::{
     event::{Event, WindowEvent},
     keyboard::{Keycode, Mod},
@@ -73,12 +73,23 @@ impl SheetFunc {
         self.0.iter().find(|f| f.name() == name).map(|x| x.as_ref())
     }
 }
+impl Default for SheetFunc {
+    fn default() -> Self {
+        Self(vec![
+            Box::new(RangeFunc),
+            Box::new(If),
+            Box::new(Sum),
+            Box::new(ValueFunc),
+            Box::new(CountIf),
+        ])
+    }
+}
 impl Sheet {
     fn new() -> Self {
         Self(
             SheetData(BTreeMap::new()),
             BTreeMap::new(),
-            SheetFunc(vec![]),
+            SheetFunc::default(),
         )
     }
     fn get(&self, cell: &SLoc) -> Result<&CellData, CellError> {
@@ -90,6 +101,20 @@ impl Sheet {
     fn insert(&mut self, cell: SLoc, val: CellData) -> Option<CellData> {
         self.1.insert(cell.clone(), 0);
         self.0.insert(cell, val)
+    }
+    fn val_mut(&mut self, cell: &SLoc) -> Option<&mut String> {
+        self.0.val_mut(cell)
+    }
+    fn remove(&mut self, cell: &SLoc) {
+        let Ok(cd) = self.get(cell) else {
+            return;
+        };
+        let to_update: HashSet<_> = cd.dependants.clone();
+        // println!("Dirtying {to_update:?}");
+        for c in to_update.into_iter() {
+            self.dirty(&c);
+        }
+        self.0.remove(cell)
     }
 }
 impl Deref for Sheet {
@@ -160,6 +185,7 @@ impl SheetData {
     }
     fn val_mut(&mut self, cell: &SLoc) -> Option<&mut String> {
         if let Some(c) = self.0.get_mut(cell) {
+            c.display = None;
             Some(&mut c.val)
         } else {
             None
@@ -311,11 +337,6 @@ fn main() {
     let mut selected = None;
     let mut prev_val = None;
     let mut data = Sheet::new();
-    data.2.add_func::<formula::If>();
-    data.2.add_func::<formula::Sum>();
-    data.2.add_func::<formula::ValueFunc>();
-    data.2.add_func::<formula::CountIf>();
-    data.2.add_func::<formula::RangeFunc>();
     let mut cursor = None;
     let mut form_select_start = None;
     let mut form_select_end = None;
@@ -996,5 +1017,16 @@ fn select_box(
                 (cellh - border) as u32,
             ))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::Sheet;
+
+    #[test]
+    fn sheet_func() {
+        let sheet = Sheet::new();
+        assert_eq!(sheet.2.iter().count(), 5);
     }
 }

@@ -147,6 +147,9 @@ impl Range {
             self.1 .0.ge(cell.0) && self.1 .1.ge(cell.1)
         }
     }
+    fn into_inf(self) -> Self {
+        Self(self.0, SLocBound(Bound::Inf, Bound::Inf))
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Const {
@@ -200,11 +203,11 @@ impl TryInto<Bound> for &Const {
     fn try_into(self) -> Result<Bound, <Self as TryInto<Bound>>::Error> {
         match self {
             Const::Error(CellError::InvalidInfinity { cell: _, cursor: _ }) => Ok(Bound::Inf),
-            Const::Num(n) => Ok(Bound::Fin(*n as i32)),
+            Const::Num(n) if n >= &0. && &n.round() == n => Ok(Bound::Fin(*n as i32)),
             _ => Err(Const::Error(CellError::BadArgument {
                 cell: None,
                 cursor: 0,
-                expected_types: vec!["Number".into(), ".I".into()],
+                expected_types: vec!["Whole number".into(), ".I".into()],
             })),
         }
     }
@@ -405,7 +408,7 @@ fn form_tree_basic<'a>(tokens: Vec<(&'a str, usize)>) -> Value {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum ParenTree<'a> {
     Paren(Vec<Box<ParenTree<'a>>>),
     Token(&'a str, usize),
@@ -440,15 +443,25 @@ impl<'a> ParenTree<'a> {
     }
     fn is_mul_args(&self) -> bool {
         match self {
-            ParenTree::Paren(p) => p.iter().skip(1).any(|t| dbg!(t).is_comma()),
+            ParenTree::Paren(p) => p.iter().skip(1).any(|t| t.is_comma()),
             ParenTree::Token(_, _) => false,
+        }
+    }
+    fn iter_flat(&self) -> impl Iterator<Item = ParenTree<'a>> {
+        match self {
+            ParenTree::Paren(p) => p
+                .iter()
+                .flat_map(|p| p.iter_flat())
+                .collect::<Vec<_>>()
+                .into_iter(),
+            ParenTree::Token(_, _) => vec![self.clone()].into_iter(),
         }
     }
     fn iter(&self) -> impl Iterator<Item = ParenTree<'a>> {
         match self {
             ParenTree::Paren(p) => p
                 .iter()
-                .flat_map(|p| p.iter())
+                .map(|x| x.as_ref().clone())
                 .collect::<Vec<_>>()
                 .into_iter(),
             ParenTree::Token(_, _) => vec![self.clone()].into_iter(),
@@ -590,7 +603,7 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
     let ParenTree::Paren(split_v) = &split_par else {
         panic!("Other case already checked");
     };
-    // dbg!(&split_par);
+    // dbg!(&split_v);
     enum Category {
         Value,
         Operand,
@@ -619,16 +632,17 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         .zip(cats)
         .map(|(v, c)| match c {
             Category::Value => {
+                dbg!(&v);
                 if v.is_mul_args() {
-                    // TODO dont do whatever it is here, need to fox split_parens
-                    let vargs: Vec<_> = v.iter().collect();
+                    // TODO dont do whatever it is here, need to fix split_parens
+                    let vargs: Vec<_> = dbg!(v.iter().collect());
 
                     CatParsed::Args(
                         vargs
                             .split(|varg| varg.is_comma())
                             .map(|varg| {
                                 dbg!(form_tree(&ParenTree::Paren(
-                                    varg.iter().map(|x| Box::new(x.clone())).collect(),
+                                    dbg!(varg).iter().map(|x| Box::new(x.clone())).collect(),
                                 )))
                                 .0
                             })
@@ -644,10 +658,12 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         })
         .peekable();
 
-    // let p2 = parseds.cloned();
-    // for e in p2 {
-    //     dbg!(e);
-    // }
+    let p2 = parseds.clone();
+    println!("Parseds:");
+    for e in p2 {
+        dbg!(e);
+    }
+    println!("Parsed End");
     // dbg!(&parseds);
 
     // Resolve function calls
@@ -993,15 +1009,23 @@ fn is_range(token: &str) -> Option<Range> {
         if &nx == &"" {
             Some(Range::range_inf(start))
         } else if let Ok(n) = nx.parse::<i32>() {
-            Some(Range(start, SLocBound(Bound::Inf, Bound::Fin(n - 1))))
+            println!("{n} {start:?}");
+            if n - 1 < start.1 {
+                None
+            } else {
+                Some(Range(start, SLocBound(Bound::Inf, Bound::Fin(n - 1))))
+            }
         } else if nx.chars().all(char::is_alphabetic) {
-            Some(Range(
-                start,
-                SLocBound(Bound::Fin(letters_to_row(nx)?), Bound::Inf),
-            ))
+            let c = letters_to_row(nx)?;
+            println!("{c} {start:?}");
+            if c < start.0 {
+                None
+            } else {
+                Some(Range(start, SLocBound(Bound::Fin(c), Bound::Inf)))
+            }
         } else {
             let end = is_ref(nx)?;
-            if split.next().is_some() {
+            if split.next().is_some() || end.0 < start.0 || end.1 < start.1 {
                 None
             } else {
                 Some(Range::range(start, end))
@@ -1349,7 +1373,7 @@ struct RangeFormula {
     value: Value,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct CellData {
     pub(crate) val: String,
 
@@ -1711,6 +1735,8 @@ impl Function for Sum {
                     if let Some(value) = sum_range(data, r, eval, spec, func, &mut s) {
                         return value;
                     }
+                } else if let Const::Error(_) = c.as_ref() {
+                    return c.into_owned();
                 } else {
                     return e;
                 }
@@ -1993,7 +2019,7 @@ impl Function for RangeFunc {
             }
             let c = *c as i32;
             let r = *r as i32;
-            refs.push((&(c, r)).into());
+            refs.push(Range::from(&(c, r)).into_inf());
             refs
         } else if let [c1, r1, c2, r2] = args {
             let c1 = c1.eval(data, eval, func, spec);
@@ -2095,12 +2121,12 @@ impl Function for RangeFunc {
             let c2 = c2.eval(data, eval, func, spec);
             let c2 = match TryInto::<Bound>::try_into(c2.as_ref()) {
                 Ok(b) => b,
-                Err(e) => return e,
+                Err(e) => return e.into_pos(spec.to_sloc()),
             };
             let r2 = r2.eval(data, eval, func, spec);
             let r2 = match TryInto::<Bound>::try_into(r2.as_ref()) {
                 Ok(b) => b,
-                Err(e) => return e,
+                Err(e) => return e.into_pos(spec.to_sloc()),
             };
             Const::Range(Range((c1, r1), SLocBound(c2, r2)))
         } else {
@@ -2115,6 +2141,7 @@ impl Function for RangeFunc {
 
 #[cfg(test)]
 mod test {
+
     use crate::formula::*;
 
     #[test]
@@ -2125,6 +2152,39 @@ mod test {
         assert_eq!(Const::from_str("-7.5"), Ok(Const::Num(-7.5)));
         assert_eq!(Const::from_str("-7.5e"), Err(()));
         assert_eq!(Const::from_str("\"Hi\""), Ok(Const::String("Hi".into())));
+        assert_eq!(Const::from_str("\"Hi"), Err(()));
+        assert_eq!(Const::from_str("Hi\""), Err(()));
+        assert_eq!(Const::from_str("abcd"), Err(()));
+
+        assert_eq!(Const::Num(1.).merge_err(&Const::Num(2.)), None);
+        assert_eq!(
+            Const::Error(CellError::ReferenceLoop {
+                loop_point: Some((0, 0))
+            })
+            .merge_err(&Const::Num(2.)),
+            Some(CellError::ReferenceLoop {
+                loop_point: Some((0, 0))
+            })
+        );
+        assert_eq!(
+            Const::Num(2.).merge_err(&Const::Error(CellError::ReferenceLoop {
+                loop_point: Some((0, 0))
+            })),
+            Some(CellError::ReferenceLoop {
+                loop_point: Some((0, 0))
+            })
+        );
+        assert_eq!(
+            Const::Error(CellError::ReferenceLoop {
+                loop_point: Some((0, 0))
+            })
+            .merge_err(&Const::Error(CellError::ReferenceLoop {
+                loop_point: Some((1, 0))
+            })),
+            Some(CellError::ReferenceLoop {
+                loop_point: Some((0, 0))
+            })
+        );
     }
     #[test]
     fn range_parse() {
@@ -2159,6 +2219,66 @@ mod test {
             is_range("A1:A"),
             Some(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
         );
+        assert_eq!(
+            is_range("A1:C"),
+            Some(Range((0, 0), SLocBound(Bound::Fin(2), Bound::Inf)))
+        );
+        assert_eq!(
+            is_range("A1:1"),
+            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Fin(0))))
+        );
+        assert_eq!(
+            is_range("A1:20"),
+            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Fin(19))))
+        );
+        assert_eq!(is_range("A0:A"), None,);
+        assert_eq!(is_range("A3:A1"), None,);
+        assert_eq!(is_range("B1:A1"), None,);
+        assert_eq!(is_range("B3:A"), None,);
+        assert_eq!(is_range("ABCDE0:ABCZZ1"), None,);
+        assert_eq!(is_range("ABC3:ABK1"), None,);
+        assert_eq!(is_range("SUS1:AMO1"), None,);
+        assert_eq!(is_range("NGU3:S"), None,);
+
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(2, 2)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(2, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(3, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(5, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(5, 5)));
+        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(0, 4)));
+        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(4, 0)));
+        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(8, 4)));
+        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(4, 8)));
+
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(2, 2)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(2, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(3, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(5, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(5, 5)));
+        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(0, 4)));
+        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(4, 0)));
+        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(8, 4)));
+        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(4, 8)));
+
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(2, 2)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(2, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(3, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(5, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(5, 5)));
+        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(0, 4)));
+        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(4, 0)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(8, 4)));
+        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(4, 8)));
+
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(2, 2)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(2, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(3, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(5, 3)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(5, 5)));
+        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(0, 4)));
+        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(4, 0)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(8, 4)));
+        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(4, 8)));
     }
     #[test]
     fn ref_inv() {
@@ -2195,6 +2315,77 @@ mod test {
         assert_eq!(is_spec(".HGREEN"), Some(Spec::dH(0, 255, 0)));
         assert_eq!(is_spec(".Hred"), Some(Spec::dH(255, 0, 0)));
         assert_eq!(is_spec(".HBlUe"), Some(Spec::dH(0, 0, 255)));
+    }
+    #[test]
+    fn spec_method() {
+        let mut s = SpecValues::from_sloc((1, 1));
+        assert_eq!(s.to_sloc(), (1, 1));
+        assert!(!s.invalid_depth(0));
+        s.depth = 5;
+        assert!(!s.invalid_depth(5));
+        assert!(s.invalid_depth(6));
+        s = s.with_sloc((2, 2));
+        assert_eq!(s.to_sloc(), (2, 2));
+    }
+    #[test]
+    fn split_paren_test() {
+        assert_eq!(
+            split_parens(&form_tokens("sum(sum(1,2),3)")),
+            Ok(ParenTree::Paren(vec![
+                Box::new(ParenTree::Token("sum", 0)),
+                Box::new(ParenTree::Paren(vec![
+                    Box::new(ParenTree::Token("sum", 4)),
+                    Box::new(ParenTree::Paren(vec![
+                        Box::new(ParenTree::Token("1", 8)),
+                        Box::new(ParenTree::Token(",", 9)),
+                        Box::new(ParenTree::Token("2", 10))
+                    ])),
+                    Box::new(ParenTree::Token(",", 12)),
+                    Box::new(ParenTree::Token("3", 13))
+                ]))
+            ]))
+        );
+        assert_eq!(
+            split_parens(&form_tokens("sum(range(1,2,3, 4),3,A5)")),
+            Ok(ParenTree::Paren(vec![
+                Box::new(ParenTree::Token("sum", 0)),
+                Box::new(ParenTree::Paren(vec![
+                    Box::new(ParenTree::Token("range", 4)),
+                    Box::new(ParenTree::Paren(vec![
+                        Box::new(ParenTree::Token("1", 10)),
+                        Box::new(ParenTree::Token(",", 11)),
+                        Box::new(ParenTree::Token("2", 12)),
+                        Box::new(ParenTree::Token(",", 13)),
+                        Box::new(ParenTree::Token("3", 14)),
+                        Box::new(ParenTree::Token(",", 15)),
+                        Box::new(ParenTree::Token("4", 17))
+                    ])),
+                    Box::new(ParenTree::Token(",", 19)),
+                    Box::new(ParenTree::Token("3", 20)),
+                    Box::new(ParenTree::Token(",", 21)),
+                    Box::new(ParenTree::Token("A5", 22))
+                ]))
+            ]))
+        );
+        assert_eq!(
+            split_parens(&form_tokens("sum(range(1,2,3, 4),3,A5)"))
+                .unwrap()
+                .get(0),
+            Some(("sum", 0))
+        );
+        assert_eq!(
+            split_parens(&form_tokens("sum(range(1,2,3, 4),3,A5)"))
+                .unwrap()
+                .get(1),
+            Some(("range", 4))
+        );
+        assert_eq!(
+            split_parens(&form_tokens("sum(range(1,2,3, 4),3,A5)"))
+                .unwrap()
+                .iter_flat()
+                .count(),
+            13
+        );
     }
     #[test]
     fn formula_parse() {
@@ -2292,5 +2483,1232 @@ mod test {
                 false
             ),
         );
+        assert_eq!(
+            form_tree(&split_parens(&dbg!(form_tokens("sum(range(0,0,10,10), 20)"))).unwrap()),
+            (
+                Value::Func {
+                    name: "sum".into(),
+                    args: vec![
+                        Value::Func {
+                            name: "range".into(),
+                            args: vec![
+                                Value::Const(Const::Num(0.)),
+                                Value::Const(Const::Num(0.)),
+                                Value::Const(Const::Num(10.)),
+                                Value::Const(Const::Num(10.)),
+                            ]
+                        },
+                        Value::Const(Const::Num(20.)),
+                        // Value::Const(Const::Num(30.))
+                    ]
+                },
+                false
+            ),
+        );
+    }
+    #[test]
+    fn func_range_test() {
+        let mut sheet = Sheet::new();
+        let spec = SpecValues::from_sloc((0, 0));
+        // sheet.insert((0,0), )
+        assert_eq!(RangeFunc.name(), "range");
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![Range((1, 1), SLocBound(Bound::Fin(3), Bound::Fin(3)))]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Range(Range((1, 1), SLocBound(Bound::Fin(3), Bound::Fin(3))))
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf)))
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::WrongNumArguments {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                arguments: vec![2, 4]
+            })
+        );
+
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf)))
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[Value::Const(Const::Num(-1.)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[Value::Const(Const::Num(-1.)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[Value::Const(Const::Num(1.6)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[Value::Const(Const::Num(1.6)), Value::Const(Const::Num(1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.6)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.6)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(-1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(-1.)),],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(-1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(-1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.6)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.6)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.6)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.6)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(-1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(-1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(-3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(-3.)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into(), ".I".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.6)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.6)),
+                    Value::Const(Const::Num(3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into(), ".I".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.6))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(3.6))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into(), ".I".into()]
+            })
+        );
+        assert_eq!(
+            RangeFunc.get_refs(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(-3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            vec![]
+        );
+        assert_eq!(
+            RangeFunc.call(
+                &[
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(1.)),
+                    Value::Const(Const::Num(3.)),
+                    Value::Const(Const::Num(-3.))
+                ],
+                &sheet.0,
+                &mut sheet.1,
+                &sheet.2,
+                &spec
+            ),
+            Const::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Whole number".into(), ".I".into()]
+            })
+        );
+    }
+    #[test]
+    fn sheet_test() {
+        let mut sheet = Sheet::new();
+        assert!(sheet
+            .insert(
+                (0, 0),
+                CellData {
+                    val: "2".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_none());
+        assert!(sheet
+            .insert(
+                (0, 1),
+                CellData {
+                    val: "3".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_none());
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=A1+A2".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_none());
+        sheet.recompute();
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "2".into(),
+                display: Some("2".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 0)),
+            Ok(&CellData {
+                val: "=A1+A2".into(),
+                display: Some("5".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=sum(A1:A10)".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        // dbg!(&sheet);
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "2".into(),
+                display: Some("2".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 0)),
+            Ok(&CellData {
+                val: "=sum(A1:A10)".into(),
+                display: Some("5".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=if(A1<A2, A2, A1)".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "2".into(),
+                display: Some("2".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 0)),
+            Ok(&CellData {
+                val: "=if(A1<A2, A2, A1)".into(),
+                display: Some("3".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+
+        assert!(sheet
+            .insert(
+                (0, 0),
+                CellData {
+                    val: "=7".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        // dbg!(&sheet);
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 0)),
+            Ok(&CellData {
+                val: "=if(A1<A2, A2, A1)".into(),
+                display: Some("7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=9e9e9".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        // dbg!(&sheet);
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(d.val, "=9e9e9");
+        assert!(d
+            .display
+            .as_ref()
+            .is_some_and(|f| f.contains("InvalidFormula")));
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        // dbg!(&sheet);
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(d.val, "=");
+        assert!(d
+            .display
+            .as_ref()
+            .is_some_and(|f| f.contains("InvalidFormula")));
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=sum(range(0,0,0,10),value(0,1))".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(d.display, Some("13".into()));
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=sum(range(0,0,0,B2),value(0,1))".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        assert!(sheet
+            .insert(
+                (1, 1),
+                CellData {
+                    val: "-1".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_none());
+        sheet.recompute();
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 1)),
+            Ok(&CellData {
+                val: "-1".into(),
+                display: Some("-1".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d.display,
+            Some(format!(
+                "{:?}",
+                CellError::BadArgument {
+                    cell: Some((1, 0)),
+                    cursor: 0,
+                    expected_types: vec!["Whole number".into(), ".I".into()]
+                }
+            ))
+        );
+        assert!(sheet
+            .insert(
+                (1, 1),
+                CellData {
+                    val: "0.6".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 1)),
+            Ok(&CellData {
+                val: "0.6".into(),
+                display: Some("0.6".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d.display,
+            Some(format!(
+                "{:?}",
+                CellError::BadArgument {
+                    cell: Some((1, 0)),
+                    cursor: 0,
+                    expected_types: vec!["Whole number".into(), ".I".into()]
+                }
+            ))
+        );
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=sum(range(0,0,B2,10),value(0,1))".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        assert!(sheet
+            .insert(
+                (1, 1),
+                CellData {
+                    val: "-1".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 1)),
+            Ok(&CellData {
+                val: "-1".into(),
+                display: Some("-1".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d.display,
+            Some(format!(
+                "{:?}",
+                CellError::BadArgument {
+                    cell: Some((1, 0)),
+                    cursor: 0,
+                    expected_types: vec!["Whole number".into(), ".I".into()]
+                }
+            ))
+        );
+        assert!(sheet
+            .insert(
+                (1, 1),
+                CellData {
+                    val: "0.6".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        assert_eq!(
+            sheet.get(&(0, 0)),
+            Ok(&CellData {
+                val: "=7".into(),
+                display: Some("7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+        assert_eq!(
+            sheet.get(&(1, 1)),
+            Ok(&CellData {
+                val: "0.6".into(),
+                display: Some("0.6".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d.display,
+            Some(format!(
+                "{:?}",
+                CellError::BadArgument {
+                    cell: Some((1, 0)),
+                    cursor: 0,
+                    expected_types: vec!["Whole number".into(), ".I".into()]
+                }
+            ))
+        );
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=if(A1<A2 & B2<A2, A2, B2)*2".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=if(A1<A2 & B2<A2, A2, B2)*2".into(),
+                display: Some("1.2".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+        assert!(sheet
+            .insert(
+                (0, 0),
+                CellData {
+                    val: "1".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=if(A1<A2 & B2<A2, A2, B2)*2".into(),
+                display: Some("6".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+
+        assert_eq!(sheet.iter().count(), 4);
+        assert_eq!(sheet.iter_mut().count(), 4);
+        assert!(sheet.iter().all(|(x, _)| x.0 < 2 && x.1 < 2));
+        assert_eq!(
+            sheet.val_mut(&(0, 0)),
+            Some(Box::leak(Box::new("1".into())))
+        );
+        dbg!(&sheet);
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=countif(A1:A10, .F.<4)".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:A10, .F.<4)".into(),
+                display: Some("2".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=countif(A1:A10, .F.<2)".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:A10, .F.<2)".into(),
+                display: Some("1".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+
+        assert!(sheet
+            .insert(
+                (1, 0),
+                CellData {
+                    val: "=countif(A1:B10, .F.<2)".into(),
+                    display: None,
+                    dependants: HashSet::new(),
+                    rangef: None,
+                },
+            )
+            .is_some());
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:B10, .F.<2)".into(),
+                display: Some(format!(
+                    "{:?}",
+                    CellError::ReferenceLoop {
+                        loop_point: Some((1, 0))
+                    }
+                )),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            }
+        );
+
+        sheet.set_disp(&(1, 0), None);
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:B10, .F.<2)".into(),
+                display: None,
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            }
+        );
+        sheet.set_disp(&(1, 0), Some("Not error".into()));
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:B10, .F.<2)".into(),
+                display: Some("Not error".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            }
+        );
+        sheet.set_disp_err(
+            &(1, 0),
+            CellError::MissingCell {
+                cell: Some((100, 100)),
+            },
+        );
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:B10, .F.<2)".into(),
+                display: Some(format!(
+                    "{:?}",
+                    CellError::MissingCell {
+                        cell: Some((100, 100))
+                    }
+                )),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            }
+        );
+
+        *sheet.val_mut(&(1, 0)).unwrap() = "=countif(A1:A10, .F.=4)-7".into();
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:A10, .F.=4)-7".into(),
+                display: Some("-7".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+        *sheet.val_mut(&(1, 0)).unwrap() = "=countif(A1:A10, .F.=1)/2".into();
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=countif(A1:A10, .F.=1)/2".into(),
+                display: Some("0.5".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+        *sheet.val_mut(&(1, 0)).unwrap() = "=value(0,1)".into();
+        sheet.recompute();
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=value(0,1)".into(),
+                display: Some("3".into()),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+        assert_eq!(
+            sheet.get(&(0, 1)),
+            Ok(&CellData {
+                val: "3".into(),
+                display: Some("3".into()),
+                dependants: [(1, 0)].into_iter().collect(),
+                rangef: None
+            })
+        );
+        dbg!(&sheet);
+        sheet.remove(&(0, 1));
+        sheet.recompute();
+        dbg!(&sheet);
+        let d = sheet.get(&(1, 0)).unwrap();
+        assert_eq!(
+            d,
+            &CellData {
+                val: "=value(0,1)".into(),
+                display: Some(format!(
+                    "{:?}",
+                    CellError::MissingCell { cell: Some((0, 1)) }
+                )),
+                dependants: HashSet::new(),
+                rangef: None
+            }
+        );
+
+        assert!(sheet.contains_key(&(0, 0)));
+        assert!(!sheet.contains_key(&(2, 2)));
     }
 }
