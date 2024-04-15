@@ -1,0 +1,1 @@
+sed 's/\.//g;s/\(.*\)/\L\1/;s/\ /\n/g' mutants.out/missed.txt | sort | uniq -c | sort -n

@@ -1,6 +1,13 @@
-use std::{borrow::Cow, collections::HashSet, rc::Rc, str::FromStr};
+use std::{borrow::Cow, collections::HashSet, fmt::Display, rc::Rc, str::FromStr};
 
-use crate::{SLoc, Sheet, SheetData, SheetEval, SheetFunc};
+use sdl2::{
+    rect::Rect,
+    render::TextureValueError,
+    surface::Surface,
+    ttf::{Font, FontError},
+};
+
+use crate::{SLoc, Sheet, SheetData, SheetEval, SheetFunc, BLACK, RED, WHITE};
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,6 +25,7 @@ pub(crate) enum Spec {
     dH(u8, u8, u8),
 }
 #[derive(Clone, Debug)]
+#[allow(non_snake_case)]
 pub(crate) struct SpecValues {
     dC: i32,
     dR: i32,
@@ -119,6 +127,95 @@ pub(crate) enum CellError {
         cursor: usize,
     },
 }
+impl Display for CellError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CellError::ReferenceLoop { loop_point } => {
+                if let Some(c) = loop_point {
+                    write!(f, "Circular reference at {}.", show_ref(c))
+                } else {
+                    write!(f, "Circular reference at unknown location.")
+                }
+            }
+            CellError::InvalidFormula {
+                cell,
+                cursor,
+                reason,
+            } => {
+                if let Some(c) = cell {
+                    write!(
+                        f,
+                        "Formula error \"{reason}\" at position {}:{cursor}",
+                        show_ref(c),
+                    )
+                } else {
+                    write!(f, "Formula parsing failed on some cell.")
+                }
+            }
+            CellError::BadArgument {
+                cell,
+                cursor,
+                expected_types,
+            } => {
+                if let Some(c) = cell {
+                    write!(
+                        f,
+                        "Expected arguments {expected_types:?} at position {}:{cursor}",
+                        show_ref(c),
+                    )
+                } else {
+                    write!(f, "Some bad argument somewhere")
+                }
+            }
+            CellError::WrongNumArguments {
+                cell,
+                cursor,
+                arguments,
+            } => {
+                if let Some(c) = cell {
+                    write!(
+                        f,
+                        "Needs {arguments:?} arguments at cell {}:{cursor}",
+                        show_ref(c)
+                    )
+                } else {
+                    write!(f, "Wrong number of arguments somewhere")
+                }
+            }
+            CellError::MissingCell { cell } => {
+                if let Some(c) = cell {
+                    write!(f, "Cell {} missing", show_ref(c),)
+                } else {
+                    write!(f, "Some cell is missing.")
+                }
+            }
+            CellError::RangeIntersect {
+                cell,
+                source1,
+                source2,
+            } => {
+                if let Some(c) = cell {
+                    write!(
+                        f,
+                        "Cell {} appears in ranges of {} and {}.",
+                        show_ref(c),
+                        show_ref(source1),
+                        show_ref(source2)
+                    )
+                } else {
+                    write!(f, "Range intersection at unknown cell.")
+                }
+            }
+            CellError::InvalidInfinity { cell, cursor } => {
+                if let Some(c) = cell {
+                    write!(f, "Cannot use infinity at {}:{cursor}", show_ref(c))
+                } else {
+                    write!(f, "Used infinity somewhere bad.")
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SLocBound(Bound, Bound);
@@ -152,33 +249,118 @@ impl Range {
     }
 }
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Const {
+pub(crate) enum ConstType {
     Num(f64),
     String(String),
     Bool(bool),
     Error(CellError),
     Range(Range),
-    Color(u8, u8, u8),
+    Color((u8, u8, u8)),
 }
 
-impl Into<String> for &Const {
-    fn into(self) -> String {
-        match self {
-            Const::Num(n) => format!("{n}"),
-            Const::String(s) => s.clone(),
-            Const::Bool(b) => format!("{b}"),
-            Const::Error(e) => format!("{e:?}"),
-            Const::Range(_) => format!("Range is not valid here"),
-            Const::Color(r, g, b) => format!("Color #{r},{g},{b}"),
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Const {
+    ct: ConstType,
+    bgcolor: (u8, u8, u8),
+    textcolor: (u8, u8, u8),
+}
+impl Into<Const> for ConstType {
+    fn into(self) -> Const {
+        if matches!(self, Self::Error(_)) {
+            Const {
+                ct: self,
+                bgcolor: WHITE.rgb(),
+                textcolor: RED.rgb(),
+            }
+        } else {
+            Const {
+                ct: self,
+                bgcolor: WHITE.rgb(),
+                textcolor: BLACK.rgb(),
+            }
         }
     }
 }
-impl Into<String> for Const {
+impl Default for Const {
+    fn default() -> Self {
+        Self {
+            ct: ConstType::String("".into()),
+            bgcolor: WHITE.rgb(),
+            textcolor: BLACK.rgb(),
+        }
+    }
+}
+#[cfg(test)]
+impl Const {
+    fn default_err() -> Self {
+        Self {
+            ct: ConstType::Error(CellError::MissingCell { cell: None }),
+            bgcolor: WHITE.rgb(),
+            textcolor: RED.rgb(),
+        }
+    }
+}
+
+impl Into<String> for &ConstType {
+    fn into(self) -> String {
+        match self {
+            ConstType::Num(n) => format!("{n}"),
+            ConstType::String(s) => s.clone(),
+            ConstType::Bool(b) => format!("{b}"),
+            ConstType::Error(e) => format!("{e}"),
+            ConstType::Range(_) => format!("Range is not valid here"),
+            ConstType::Color((r, g, b)) => format!("Color #{r},{g},{b}"),
+        }
+    }
+}
+pub(crate) trait RenderColor<T> {
+    type Err;
+    fn render_c(&self, r: T) -> Result<Surface, Self::Err>;
+}
+pub(crate) enum RenderError {
+    FontError(FontError),
+    TextureValueError(TextureValueError),
+    String(String),
+}
+impl From<FontError> for RenderError {
+    fn from(value: FontError) -> Self {
+        Self::FontError(value)
+    }
+}
+impl From<TextureValueError> for RenderError {
+    fn from(value: TextureValueError) -> Self {
+        Self::TextureValueError(value)
+    }
+}
+impl From<String> for RenderError {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+impl RenderColor<&Const> for Font<'_, '_> {
+    fn render_c(&self, r: &Const) -> Result<Surface<'_>, RenderError> {
+        let txt = self
+            .render(&<&ConstType as Into<String>>::into(&r.ct))
+            .solid(r.textcolor)?;
+        let mut bg = Surface::new(
+            txt.width(),
+            txt.height(),
+            sdl2::pixels::PixelFormatEnum::RGB888,
+        )?;
+        let fullrect = Rect::new(0, 0, bg.width(), bg.height());
+        bg.fill_rect(fullrect, r.bgcolor.into())?;
+        txt.blit(fullrect, &mut bg, fullrect)?;
+        Ok(bg)
+    }
+
+    type Err = RenderError;
+}
+impl Into<String> for ConstType {
     fn into(self) -> String {
         (&self).into()
     }
 }
-impl FromStr for Const {
+impl FromStr for ConstType {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -197,14 +379,21 @@ impl FromStr for Const {
         }
     }
 }
-impl TryInto<Bound> for &Const {
-    type Error = Const;
+impl FromStr for Const {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ConstType::from_str(s).map(ConstType::into)
+    }
+}
+impl TryInto<Bound> for &ConstType {
+    type Error = ConstType;
 
     fn try_into(self) -> Result<Bound, <Self as TryInto<Bound>>::Error> {
         match self {
-            Const::Error(CellError::InvalidInfinity { cell: _, cursor: _ }) => Ok(Bound::Inf),
-            Const::Num(n) if n >= &0. && &n.round() == n => Ok(Bound::Fin(*n as i32)),
-            _ => Err(Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::InvalidInfinity { cell: _, cursor: _ }) => Ok(Bound::Inf),
+            ConstType::Num(n) if n >= &0. && &n.round() == n => Ok(Bound::Fin(*n as i32)),
+            _ => Err(ConstType::Error(CellError::BadArgument {
                 cell: None,
                 cursor: 0,
                 expected_types: vec!["Whole number".into(), ".I".into()],
@@ -213,10 +402,10 @@ impl TryInto<Bound> for &Const {
     }
 }
 
-impl Const {
+impl ConstType {
     fn into_pos(self, pos: SLoc) -> Self {
         match self {
-            Const::Error(e) => Self::Error(match e {
+            Self::Error(e) => Self::Error(match e {
                 CellError::ReferenceLoop { loop_point: None } => CellError::ReferenceLoop {
                     loop_point: Some(pos),
                 },
@@ -253,14 +442,36 @@ impl Const {
             _ => self,
         }
     }
-    fn to_pos(&self, pos: SLoc) -> Self {
-        self.clone().into_pos(pos)
-    }
-    fn merge_err(&self, rhs: &Const) -> Option<CellError> {
+    // fn to_pos(&self, pos: SLoc) -> Self {
+    //     self.clone().into_pos(pos)
+    // }
+    #[cfg(test)]
+    fn merge_err(&self, rhs: &Self) -> Option<CellError> {
         if let Self::Error(e) = self {
             Some(e.clone())
         } else if let Self::Error(e) = rhs.clone() {
             Some(e.clone())
+        } else {
+            None
+        }
+    }
+}
+impl Const {
+    fn into_pos(self, pos: SLoc) -> Self {
+        Self {
+            ct: self.ct.into_pos(pos),
+            bgcolor: self.bgcolor,
+            textcolor: self.textcolor,
+        }
+    }
+    fn to_pos(&self, pos: SLoc) -> Self {
+        self.clone().into_pos(pos)
+    }
+    fn merge_err(&self, rhs: &Self) -> Option<Self> {
+        if let ConstType::Error(_) = &self.ct {
+            Some(self.clone())
+        } else if let ConstType::Error(_) = &rhs.ct {
+            Some(rhs.clone())
         } else {
             None
         }
@@ -304,7 +515,7 @@ fn form_tokens<'a>(formula: &'a str) -> Vec<(&'a str, usize)> {
     let mut start = 0;
     let mut alpha = true;
 
-    let mut string_mode = false;
+    let mut string_mode: Option<String> = None;
     let mut escape_mode = false;
     for (i, c) in formula.chars().enumerate() {
         if alpha {
@@ -315,17 +526,24 @@ fn form_tokens<'a>(formula: &'a str) -> Vec<(&'a str, usize)> {
             }
         }
         if !alpha {
-            if c == '"' || string_mode {
-                if string_mode {
+            if c == '"' || string_mode.is_some() {
+                println!("c:{c} esc:{escape_mode}");
+                if let Some(mut string_val) = string_mode {
                     if c == '"' && !escape_mode {
-                        string_mode = false;
-                        v.push((&formula[start..=i], start));
+                        string_mode = None;
+                        string_val.push('"');
+                        v.push((string_val.leak(), start));
                         start = i + 1;
                     } else if c == '\\' && !escape_mode {
+                        string_mode = Some(string_val);
                         escape_mode = true;
+                    } else {
+                        string_val.push(c);
+                        string_mode = Some(string_val);
+                        escape_mode = false;
                     }
                 } else if c == '"' {
-                    string_mode = true;
+                    string_mode = Some("\"".into());
                 }
             } else {
                 if c.is_iden() {
@@ -346,67 +564,85 @@ fn form_tokens<'a>(formula: &'a str) -> Vec<(&'a str, usize)> {
     v
 }
 
-#[allow(dead_code)]
-fn form_tree_basic<'a>(tokens: Vec<(&'a str, usize)>) -> Value {
-    if tokens.is_empty() {
-        Value::Const(Const::Error(CellError::InvalidFormula {
-            cell: None,
-            cursor: 1,
-            reason: "Nothing after =",
-        }))
-    } else if tokens.len() == 3 {
-        let t1 = if let Some(reff) = is_ref(tokens[0].0) {
-            Value::Ref(reff)
-        } else if let Ok(cn) = tokens[0].0.parse::<f64>() {
-            Value::Const(Const::Num(cn))
-        } else {
-            Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: tokens[0].1,
-                reason: "Token not value or reference",
-            }))
-        };
-        let t3 = if let Some(reff) = is_ref(tokens[2].0) {
-            Value::Ref(reff)
-        } else if let Ok(cn) = tokens[2].0.parse::<f64>() {
-            Value::Const(Const::Num(cn))
-        } else {
-            Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: tokens[2].1,
-                reason: "Token not value or reference",
-            }))
-        };
-        dbg!((&t1, tokens[1], &t3));
-        match tokens[1].0 {
-            "+" => Value::Add(Rc::new(t1), Rc::new(t3)),
-            // "-" => Value::Sub(Rc::new(t1), Rc::new(t3)),
-            _ => Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: tokens[1].1,
-                reason: "Operation not allowed",
-            })),
-        }
-    } else if tokens.len() == 1 {
-        if let Some(reff) = is_ref(tokens[0].0) {
-            Value::Ref(reff)
-        } else if let Ok(cn) = tokens[0].0.parse::<f64>() {
-            Value::Const(Const::Num(cn))
-        } else {
-            Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: 1,
-                reason: "Token not value or reference",
-            }))
-        }
-    } else {
-        Value::Const(Const::Error(CellError::InvalidFormula {
-            cell: None,
-            cursor: tokens.last().expect("Wasnt empty").1,
-            reason: "Invalid number of tokens",
-        }))
-    }
-}
+// #[allow(dead_code)]
+// fn form_tree_basic<'a>(tokens: Vec<(&'a str, usize)>) -> Value {
+//     if tokens.is_empty() {
+//         Value::Const(
+//             ConstType::Error(CellError::InvalidFormula {
+//                 cell: None,
+//                 cursor: 1,
+//                 reason: "Nothing after =",
+//             })
+//             .into(),
+//         )
+//     } else if tokens.len() == 3 {
+//         let t1 = if let Some(reff) = is_ref(tokens[0].0) {
+//             Value::Ref(reff)
+//         } else if let Ok(cn) = tokens[0].0.parse::<f64>() {
+//             Value::Const(ConstType::Num(cn).into())
+//         } else {
+//             Value::Const(
+//                 ConstType::Error(CellError::InvalidFormula {
+//                     cell: None,
+//                     cursor: tokens[0].1,
+//                     reason: "Token not value or reference",
+//                 })
+//                 .into(),
+//             )
+//         };
+//         let t3 = if let Some(reff) = is_ref(tokens[2].0) {
+//             Value::Ref(reff)
+//         } else if let Ok(cn) = tokens[2].0.parse::<f64>() {
+//             Value::Const(ConstType::Num(cn).into())
+//         } else {
+//             Value::Const(
+//                 ConstType::Error(CellError::InvalidFormula {
+//                     cell: None,
+//                     cursor: tokens[2].1,
+//                     reason: "Token not value or reference",
+//                 })
+//                 .into(),
+//             )
+//         };
+//         dbg!((&t1, tokens[1], &t3));
+//         match tokens[1].0 {
+//             "+" => Value::Add(Rc::new(t1), Rc::new(t3)),
+//             // "-" => Value::Sub(Rc::new(t1), Rc::new(t3)),
+//             _ => Value::Const(
+//                 ConstType::Error(CellError::InvalidFormula {
+//                     cell: None,
+//                     cursor: tokens[1].1,
+//                     reason: "Operation not allowed",
+//                 })
+//                 .into(),
+//             ),
+//         }
+//     } else if tokens.len() == 1 {
+//         if let Some(reff) = is_ref(tokens[0].0) {
+//             Value::Ref(reff)
+//         } else if let Ok(cn) = tokens[0].0.parse::<f64>() {
+//             Value::Const(ConstType::Num(cn).into())
+//         } else {
+//             Value::Const(
+//                 ConstType::Error(CellError::InvalidFormula {
+//                     cell: None,
+//                     cursor: 1,
+//                     reason: "Token not value or reference",
+//                 })
+//                 .into(),
+//             )
+//         }
+//     } else {
+//         Value::Const(
+//             ConstType::Error(CellError::InvalidFormula {
+//                 cell: None,
+//                 cursor: tokens.last().expect("Wasnt empty").1,
+//                 reason: "Invalid number of tokens",
+//             })
+//             .into(),
+//         )
+//     }
+// }
 
 #[derive(Debug, Clone, PartialEq)]
 enum ParenTree<'a> {
@@ -447,6 +683,7 @@ impl<'a> ParenTree<'a> {
             ParenTree::Token(_, _) => false,
         }
     }
+    #[cfg(test)]
     fn iter_flat(&self) -> impl Iterator<Item = ParenTree<'a>> {
         match self {
             ParenTree::Paren(p) => p
@@ -537,11 +774,14 @@ fn split_parens<'a, 'b>(tokens: &'b [(&'a str, usize)]) -> Result<ParenTree<'a>,
                 pcount -= 1;
             }
             if pcount < 0 {
-                return Err(Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: t.1,
-                    reason: "Ending parenthesis with no opening",
-                })));
+                return Err(Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: t.1,
+                        reason: "Ending parenthesis with no opening",
+                    })
+                    .into(),
+                ));
             }
             if pcount == 0 {
                 if let Some(ps) = pstart {
@@ -554,11 +794,14 @@ fn split_parens<'a, 'b>(tokens: &'b [(&'a str, usize)]) -> Result<ParenTree<'a>,
             }
         }
         if pcount != 0 {
-            Err(Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: tokens.last().unwrap().1,
-                reason: "Missing closing parenthesis",
-            })))
+            Err(Value::Const(
+                ConstType::Error(CellError::InvalidFormula {
+                    cell: None,
+                    cursor: tokens.last().unwrap().1,
+                    reason: "Missing closing parenthesis",
+                })
+                .into(),
+            ))
         } else {
             Ok(ParenTree::Paren(split_par_vec))
         }
@@ -570,11 +813,14 @@ fn split_parens<'a, 'b>(tokens: &'b [(&'a str, usize)]) -> Result<ParenTree<'a>,
 fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
     if split_par.len() == 0 {
         return (
-            Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: 0,
-                reason: "No formula given",
-            })),
+            Value::Const(
+                ConstType::Error(CellError::InvalidFormula {
+                    cell: None,
+                    cursor: 0,
+                    reason: "No formula given",
+                })
+                .into(),
+            ),
             false,
         );
     }
@@ -587,15 +833,18 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         } else if let Some(s) = is_spec(sp) {
             (Value::Special(s), false)
         } else if let Some(r) = is_range(sp) {
-            (Value::Const(Const::Range(r)), false)
+            (Value::Const(ConstType::Range(r).into()), false)
         } else {
             dbg!(sp);
             (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: *i,
-                    reason: "Couldn't parse token",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: *i,
+                        reason: "Couldn't parse token",
+                    })
+                    .into(),
+                ),
                 false,
             )
         };
@@ -676,11 +925,14 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
             let lp = split_par.get(i).unwrap();
             let Some(args) = parseds.next() else {
                 return (
-                    Value::Const(Const::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: lp.1,
-                        reason: "Function has no arguments",
-                    })),
+                    Value::Const(
+                        ConstType::Error(CellError::InvalidFormula {
+                            cell: None,
+                            cursor: lp.1,
+                            reason: "Function has no arguments",
+                        })
+                        .into(),
+                    ),
                     false,
                 );
             };
@@ -691,11 +943,14 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
                 CatParsed::Args(a) => a,
                 CatParsed::Operand(_) | CatParsed::Function(_) => {
                     return (
-                        Value::Const(Const::Error(CellError::InvalidFormula {
-                            cell: None,
-                            cursor: lp.1,
-                            reason: "Invalid function arguments",
-                        })),
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: lp.1,
+                                reason: "Invalid function arguments",
+                            })
+                            .into(),
+                        ),
                         false,
                     )
                 }
@@ -713,11 +968,14 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         } else if let CatParsed::Args(_) = e {
             let lp = split_par.get(i).unwrap();
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: lp.1,
-                    reason: "Arguments with no function",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: lp.1,
+                        reason: "Arguments with no function",
+                    })
+                    .into(),
+                ),
                 false,
             );
         } else {
@@ -731,22 +989,28 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
             // assert!(matches!(e, CatParsed::Value(_)))
             if matches!(e.0, CatParsed::Operand(_)) {
                 return (
-                    Value::Const(Const::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: e.1,
-                        reason: "Found operand where value was expected",
-                    })),
+                    Value::Const(
+                        ConstType::Error(CellError::InvalidFormula {
+                            cell: None,
+                            cursor: e.1,
+                            reason: "Found operand where value was expected",
+                        })
+                        .into(),
+                    ),
                     false,
                 );
             }
         } else {
             if matches!(e.0, CatParsed::Value(_)) {
                 return (
-                    Value::Const(Const::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: e.1,
-                        reason: "Found value where operand was expected",
-                    })),
+                    Value::Const(
+                        ConstType::Error(CellError::InvalidFormula {
+                            cell: None,
+                            cursor: e.1,
+                            reason: "Found value where operand was expected",
+                        })
+                        .into(),
+                    ),
                     false,
                 );
             }
@@ -763,22 +1027,28 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         let lhs = token_orchard.remove(p - 1);
         let (CatParsed::Value(lhs), i) = lhs else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: lhs.1,
-                    reason: "Left side of mul/div was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: lhs.1,
+                        reason: "Left side of mul/div was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
         let rhs = token_orchard.remove(p);
         let CatParsed::Value(rhs) = rhs.0 else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: rhs.1,
-                    reason: "Right side of mul/div was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: rhs.1,
+                        reason: "Right side of mul/div was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
@@ -805,22 +1075,28 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         let lhs = token_orchard.remove(p - 1);
         let (CatParsed::Value(lhs), i) = lhs else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: lhs.1,
-                    reason: "Left side of add/sub was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: lhs.1,
+                        reason: "Left side of add/sub was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
         let rhs = token_orchard.remove(p);
         let CatParsed::Value(rhs) = rhs.0 else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: rhs.1,
-                    reason: "Right side of add/sub was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: rhs.1,
+                        reason: "Right side of add/sub was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
@@ -848,22 +1124,28 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         let lhs = token_orchard.remove(p - 1);
         let (CatParsed::Value(lhs), i) = lhs else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: lhs.1,
-                    reason: "Left side of equality/inequality was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: lhs.1,
+                        reason: "Left side of equality/inequality was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
         let rhs = token_orchard.remove(p);
         let CatParsed::Value(rhs) = rhs.0 else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: rhs.1,
-                    reason: "Right side of equality/inequality was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: rhs.1,
+                        reason: "Right side of equality/inequality was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
@@ -879,11 +1161,14 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
             );
         } else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: token_orchard[inpos].1,
-                    reason: "Operand is not supported",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: token_orchard[inpos].1,
+                        reason: "Operand is not supported",
+                    })
+                    .into(),
+                ),
                 false,
             );
         }
@@ -900,22 +1185,28 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
         let lhs = token_orchard.remove(p - 1);
         let (CatParsed::Value(lhs), i) = lhs else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: lhs.1,
-                    reason: "Left side of logic was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: lhs.1,
+                        reason: "Left side of logic was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
         let rhs = token_orchard.remove(p);
         let CatParsed::Value(rhs) = rhs.0 else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: rhs.1,
-                    reason: "Right side of logic was not value",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: rhs.1,
+                        reason: "Right side of logic was not value",
+                    })
+                    .into(),
+                ),
                 false,
             );
         };
@@ -926,11 +1217,14 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
             );
         } else {
             return (
-                Value::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: token_orchard[inpos].1,
-                    reason: "Operand is not supported",
-                })),
+                Value::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: token_orchard[inpos].1,
+                        reason: "Operand is not supported",
+                    })
+                    .into(),
+                ),
                 false,
             );
         }
@@ -938,11 +1232,14 @@ fn form_tree<'a>(split_par: &ParenTree<'a>) -> (Value, bool) {
 
     let (CatParsed::Value((ret, _)), _) = token_orchard[0].clone() else {
         return (
-            Value::Const(Const::Error(CellError::InvalidFormula {
-                cell: None,
-                cursor: token_orchard[0].1,
-                reason: "Something weird happened idk",
-            })),
+            Value::Const(
+                ConstType::Error(CellError::InvalidFormula {
+                    cell: None,
+                    cursor: token_orchard[0].1,
+                    reason: "Something weird happened idk",
+                })
+                .into(),
+            ),
             false,
         );
     };
@@ -1000,7 +1297,7 @@ pub(crate) fn show_col(x: i32) -> String {
 }
 
 fn is_const(token: &str) -> Option<Const> {
-    Const::from_str(token).ok()
+    ConstType::from_str(token).ok().map(ConstType::into)
 }
 fn is_range(token: &str) -> Option<Range> {
     let mut split = token.split(":");
@@ -1090,11 +1387,14 @@ impl FromStr for Value {
                 };
                 Ok(form_tree(&split).0)
             } else {
-                Ok(Self::Const(Const::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: 0,
-                    reason: "Range formulas not yet supported",
-                })))
+                Ok(Self::Const(
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: None,
+                        cursor: 0,
+                        reason: "Range formulas not yet supported",
+                    })
+                    .into(),
+                ))
             }
         }
     }
@@ -1109,22 +1409,36 @@ impl Value {
         func: &SheetFunc,
         spec: &'a SpecValues,
     ) -> Cow<'a, Const> {
-        // Const::String("".into())
+        // ConstType::String("".into().into())
         let l = (spec.dC, spec.dR);
         if eval.get(&l).is_some_and(|x| spec.invalid_depth(*x)) {
             // dbg!(spec, eval.get(&l));
             eval.get_mut(&l).map(|x| *x = 0);
-            return Cow::Owned(Const::Error(CellError::ReferenceLoop {
-                loop_point: Some(l),
-            }));
+            return Cow::Owned(
+                ConstType::Error(CellError::ReferenceLoop {
+                    loop_point: Some(l),
+                })
+                .into(),
+            );
         }
-        eval.get_mut(&l).map(|x| *x = spec.depth);
+        if eval.contains_key(&l) {
+            eval.get_mut(&l).map(|x| *x = spec.depth);
+        } else {
+            eval.insert(l, spec.depth);
+        }
         let t = match self {
-            Value::Const(Const::Range(_)) => Cow::Owned(Const::Error(CellError::InvalidFormula {
-                cell: Some(spec.to_sloc()),
-                cursor: 0,
-                reason: "Range cannot be assigned to a cell",
-            })),
+            Value::Const(Const {
+                ct: ConstType::Range(_),
+                bgcolor: _,
+                textcolor: _,
+            }) => Cow::Owned(
+                ConstType::Error(CellError::InvalidFormula {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    reason: "Range cannot be assigned to a cell",
+                })
+                .into(),
+            ),
             Value::Const(c) => Cow::Borrowed(c),
             Value::Ref(r) => Cow::Owned({
                 let vr = data
@@ -1132,9 +1446,10 @@ impl Value {
                     .map(|d| {
                         let new_spec = spec.clone().with_sloc(*r);
                         if eval.get(r).is_some_and(|x| spec.invalid_depth(*x)) {
-                            Const::Error(CellError::ReferenceLoop {
+                            ConstType::Error(CellError::ReferenceLoop {
                                 loop_point: Some(*r),
                             })
+                            .into()
                         } else {
                             d.val
                                 .parse::<Value>()
@@ -1144,7 +1459,7 @@ impl Value {
                                 .into_pos(*r)
                         }
                     })
-                    .map_err(|e| Const::Error(e))
+                    .map_err(|e| ConstType::Error(e).into())
                     .unwrap_or_else(|e| e);
                 vr
             }),
@@ -1152,170 +1467,197 @@ impl Value {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
                 if let Some(e) = lhs_eval.merge_err(&rhs_eval) {
-                    Cow::Owned(Const::Error(e))
-                } else if let (Const::Num(lnum), Const::Num(rnum)) =
-                    (lhs_eval.as_ref(), rhs_eval.as_ref())
+                    Cow::Owned(e)
+                } else if let (ConstType::Num(lnum), ConstType::Num(rnum)) =
+                    (&lhs_eval.as_ref().ct, &rhs_eval.as_ref().ct)
                 {
-                    Cow::Owned(Const::Num(lnum + rnum))
+                    Cow::Owned(ConstType::Num(lnum + rnum).into())
                 } else {
-                    Cow::Owned(Const::Error(CellError::BadArgument {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                        expected_types: vec!["Num".into(), "Num".into()],
-                    }))
+                    Cow::Owned(
+                        ConstType::Error(CellError::BadArgument {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                            expected_types: vec!["Num".into(), "Num".into()],
+                        })
+                        .into(),
+                    )
                 }
             }
             Value::Sub(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
                 if let Some(e) = lhs_eval.merge_err(&rhs_eval) {
-                    Cow::Owned(Const::Error(e))
-                } else if let (Const::Num(lnum), Const::Num(rnum)) =
-                    (lhs_eval.as_ref(), rhs_eval.as_ref())
+                    Cow::Owned(e)
+                } else if let (ConstType::Num(lnum), ConstType::Num(rnum)) =
+                    (&lhs_eval.as_ref().ct, &rhs_eval.as_ref().ct)
                 {
-                    Cow::Owned(Const::Num(lnum - rnum))
+                    Cow::Owned(ConstType::Num(lnum - rnum).into())
                 } else {
-                    Cow::Owned(Const::Error(CellError::BadArgument {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                        expected_types: vec!["Num".into(), "Num".into()],
-                    }))
+                    Cow::Owned(
+                        ConstType::Error(CellError::BadArgument {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                            expected_types: vec!["Num".into(), "Num".into()],
+                        })
+                        .into(),
+                    )
                 }
             }
             Value::Special(s) => {
                 match s {
-                    Spec::dd => Cow::Owned(Const::Error(CellError::ReferenceLoop {
-                        loop_point: Some(spec.to_sloc()),
-                    })),
-                    Spec::dC => Cow::Owned(Const::Num(spec.dC as f64)),
-                    Spec::dR => Cow::Owned(Const::Num(spec.dR as f64)),
+                    Spec::dd => Cow::Owned(
+                        ConstType::Error(CellError::ReferenceLoop {
+                            loop_point: Some(spec.to_sloc()),
+                        })
+                        .into(),
+                    ),
+                    Spec::dC => Cow::Owned(ConstType::Num(spec.dC as f64).into()),
+                    Spec::dR => Cow::Owned(ConstType::Num(spec.dR as f64).into()),
                     Spec::dSd => {
                         if let Some(ref v) = spec.dSd {
                             Cow::Borrowed(v)
                         } else {
-                            Cow::Owned(Const::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }))
+                            Cow::Owned(ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into())
                         }
                     }
                     Spec::dSC => Cow::Owned(if let Some(v) = spec.dSC {
-                        Const::Num(v as f64)
+                        ConstType::Num(v as f64).into()
                     } else {
-                        Const::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." })
+                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
                     }),
                     Spec::dSR => Cow::Owned(if let Some(v) = spec.dSR {
-                        Const::Num(v as f64)
+                        ConstType::Num(v as f64).into()
                     } else {
-                        Const::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." })
+                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
                     }),
                     Spec::dFd => {
                         if let Some(ref v) = spec.dFd {
                             Cow::Borrowed(v)
                         } else {
-                            Cow::Owned(Const::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }))
+                            Cow::Owned(ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into())
                         }
                     }
                     Spec::dFC => Cow::Owned(if let Some(v) = spec.dFC {
-                        Const::Num(v as f64)
+                        ConstType::Num(v as f64).into()
                     } else {
-                        Const::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." })
+                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
                     }),
                     Spec::dFR => Cow::Owned(if let Some(v) = spec.dFR {
-                        Const::Num(v as f64)
+                        ConstType::Num(v as f64).into()
                     } else {
-                        Const::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." })
+                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
                     }),
-                    Spec::dI => Cow::Owned(Const::Error(CellError::InvalidInfinity {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                    })),
-                    Spec::dH(r, g, b) => Cow::Owned(Const::Color(*r, *g, *b)),
+                    Spec::dI => Cow::Owned(
+                        ConstType::Error(CellError::InvalidInfinity {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                        })
+                        .into(),
+                    ),
+                    Spec::dH(r, g, b) => Cow::Owned(ConstType::Color((*r, *g, *b)).into()),
                 }
             }
             Value::Mul(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
                 if let Some(e) = lhs_eval.merge_err(&rhs_eval) {
-                    Cow::Owned(Const::Error(e))
-                } else if let (Const::Num(lnum), Const::Num(rnum)) =
-                    (lhs_eval.as_ref(), rhs_eval.as_ref())
+                    Cow::Owned(e)
+                } else if let (ConstType::Num(lnum), ConstType::Num(rnum)) =
+                    (&lhs_eval.as_ref().ct, &rhs_eval.as_ref().ct)
                 {
-                    Cow::Owned(Const::Num(lnum * rnum))
+                    Cow::Owned(ConstType::Num(lnum * rnum).into())
                 } else {
-                    Cow::Owned(Const::Error(CellError::BadArgument {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                        expected_types: vec!["Num".into(), "Num".into()],
-                    }))
+                    Cow::Owned(
+                        ConstType::Error(CellError::BadArgument {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                            expected_types: vec!["Num".into(), "Num".into()],
+                        })
+                        .into(),
+                    )
                 }
             }
             Value::Div(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
                 if let Some(e) = lhs_eval.merge_err(&rhs_eval) {
-                    Cow::Owned(Const::Error(e))
-                } else if let (Const::Num(lnum), Const::Num(rnum)) =
-                    (lhs_eval.as_ref(), rhs_eval.as_ref())
+                    Cow::Owned(e)
+                } else if let (ConstType::Num(lnum), ConstType::Num(rnum)) =
+                    (&lhs_eval.as_ref().ct, &rhs_eval.as_ref().ct)
                 {
-                    Cow::Owned(Const::Num(lnum / rnum))
+                    Cow::Owned(ConstType::Num(lnum / rnum).into())
                 } else {
-                    Cow::Owned(Const::Error(CellError::BadArgument {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                        expected_types: vec!["Num".into(), "Num".into()],
-                    }))
+                    Cow::Owned(
+                        ConstType::Error(CellError::BadArgument {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                            expected_types: vec!["Num".into(), "Num".into()],
+                        })
+                        .into(),
+                    )
                 }
             }
             Value::Lt(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
                 if let Some(e) = lhs_eval.merge_err(&rhs_eval) {
-                    Cow::Owned(Const::Error(e))
-                } else if let (Const::Num(lnum), Const::Num(rnum)) =
-                    (lhs_eval.as_ref(), rhs_eval.as_ref())
+                    Cow::Owned(e)
+                } else if let (ConstType::Num(lnum), ConstType::Num(rnum)) =
+                    (&lhs_eval.as_ref().ct, &rhs_eval.as_ref().ct)
                 {
-                    Cow::Owned(Const::Bool(lnum < rnum))
+                    Cow::Owned(ConstType::Bool(lnum < rnum).into())
                 } else {
-                    Cow::Owned(Const::Error(CellError::BadArgument {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                        expected_types: vec!["Num".into(), "Num".into()],
-                    }))
+                    Cow::Owned(
+                        ConstType::Error(CellError::BadArgument {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                            expected_types: vec!["Num".into(), "Num".into()],
+                        })
+                        .into(),
+                    )
                 }
             }
             Value::Func { name, args } => {
                 if let Some(f) = func.get_func(name) {
                     Cow::Owned(f.call(args, data, eval, func, spec))
                 } else {
-                    Cow::Owned(Const::Error(CellError::InvalidFormula {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                        reason: "Formula not found",
-                    }))
+                    Cow::Owned(
+                        ConstType::Error(CellError::InvalidFormula {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                            reason: "Formula not found",
+                        })
+                        .into(),
+                    )
                 }
             }
             Value::Eq(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
                 if let Some(e) = lhs_eval.merge_err(&rhs_eval) {
-                    Cow::Owned(Const::Error(e))
+                    Cow::Owned(e)
                 } else {
-                    Cow::Owned(Const::Bool(lhs_eval == rhs_eval))
+                    Cow::Owned(ConstType::Bool(lhs_eval == rhs_eval).into())
                 }
             }
             Value::And(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, spec);
                 let rhs_eval = rhs.eval(data, eval, func, spec);
                 if let Some(e) = lhs_eval.merge_err(&rhs_eval) {
-                    Cow::Owned(Const::Error(e))
-                } else if let (Const::Bool(lnum), Const::Bool(rnum)) =
-                    (lhs_eval.as_ref(), rhs_eval.as_ref())
+                    Cow::Owned(e)
+                } else if let (ConstType::Bool(lnum), ConstType::Bool(rnum)) =
+                    (&lhs_eval.as_ref().ct, &rhs_eval.as_ref().ct)
                 {
-                    Cow::Owned(Const::Bool(*lnum && *rnum))
+                    Cow::Owned(ConstType::Bool(*lnum && *rnum).into())
                 } else {
-                    Cow::Owned(Const::Error(CellError::BadArgument {
-                        cell: Some(spec.to_sloc()),
-                        cursor: 0,
-                        expected_types: vec!["Num".into(), "Num".into()],
-                    }))
+                    Cow::Owned(
+                        ConstType::Error(CellError::BadArgument {
+                            cell: Some(spec.to_sloc()),
+                            cursor: 0,
+                            expected_types: vec!["Num".into(), "Num".into()],
+                        })
+                        .into(),
+                    )
                 }
             }
         };
@@ -1347,7 +1689,10 @@ impl Value {
                 .iter()
                 .flat_map(|f| f.get_refs(args, data, eval, func, spec))
                 .collect(),
-            Value::Const(Const::Range(r)) => vec![r.clone()],
+            Value::Const(Const {
+                ct: ConstType::Range(r),
+                ..
+            }) => vec![r.clone()],
             Value::Const(_) | Value::Special(_) => vec![],
         }
     }
@@ -1379,7 +1724,7 @@ pub(crate) struct CellData {
 
     /// Is none when recalculating
     // pub(crate) parsed: Option<Value>,
-    pub(crate) display: Option<String>,
+    pub(crate) display: Option<Const>,
     // Flag for detecting loops
     /// Dependants, aka cells that depend on this one
     pub(crate) dependants: HashSet<SLoc>,
@@ -1391,7 +1736,7 @@ impl FromStr for CellData {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let c = CellData {
-            // val: Value::Const(Const::String(s.into())),
+            // val: Value::Const(ConstType::String(s.into().into())),
             val: s.into(),
             display: None,
             dependants: HashSet::new(),
@@ -1423,24 +1768,25 @@ impl CellData {
     }
 }
 impl Sheet {
-    fn set_eval(&mut self, cell: &SLoc, eval: usize) {
-        if let Some(c) = self.1.get_mut(cell) {
-            *c = eval;
-        }
-    }
-    fn get_eval(&self, cell: &SLoc) -> usize {
-        if let Some(c) = self.1.get(cell) {
-            *c
-        } else {
-            0
-        }
-    }
+    // fn set_eval(&mut self, cell: &SLoc, eval: usize) {
+    //     if let Some(c) = self.1.get_mut(cell) {
+    //         *c = eval;
+    //     }
+    // }
+    // fn get_eval(&self, cell: &SLoc) -> usize {
+    //     if let Some(c) = self.1.get(cell) {
+    //         *c
+    //     } else {
+    //         0
+    //     }
+    // }
+    #[cfg(test)]
     fn set_disp_err(&mut self, cell: &SLoc, err: CellError) {
         if let Some(c) = self.0 .0.get_mut(cell) {
-            c.display = Some(Const::Error(err).into())
+            c.display = Some(ConstType::Error(err).into())
         }
     }
-    fn set_disp(&mut self, cell: &SLoc, v: Option<String>) {
+    fn set_disp(&mut self, cell: &SLoc, v: Option<Const>) {
         if let Some(c) = self.0 .0.get_mut(cell) {
             c.display = v
         }
@@ -1553,14 +1899,17 @@ impl Sheet {
                     let val = s.val.clone();
                     match val.parse::<Value>() {
                         Ok(val) => val,
-                        Err(e) => Value::Const(Const::Error(CellError::InvalidFormula {
-                            cell: Some(pos),
-                            cursor: 0,
-                            reason: e,
-                        })),
+                        Err(e) => Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: Some(pos),
+                                cursor: 0,
+                                reason: e,
+                            })
+                            .into(),
+                        ),
                     }
                 } else {
-                    Value::Const(Const::Error(s.unwrap_err()))
+                    Value::Const(ConstType::Error(s.unwrap_err()).into())
                 };
 
                 // Add depends
@@ -1577,7 +1926,7 @@ impl Sheet {
                 //         let _ = self.insert(d.0, cd);
                 //     }
                 //     if d.0 == pos {
-                //         val = Value::Const(Const::Error(CellError::ReferenceLoop {
+                //         val = Value::Const(ConstType::Error(.into()CellError::ReferenceLoop {
                 //             loop_point: Some(pos),
                 //         }));
                 //     }
@@ -1602,11 +1951,8 @@ impl Sheet {
                     dFR: None,
                     depth: 0,
                 };
-                let tmp: Option<String> = Some(
-                    val.eval(&self.0, &mut self.1, &self.2, &spec)
-                        .to_pos(pos)
-                        .into(),
-                );
+                let tmp: Option<Const> =
+                    Some(val.eval(&self.0, &mut self.1, &self.2, &spec).to_pos(pos));
                 // dbg!(&tmp);
                 // let sm = self.get_mut(&pos).expect("Cell was deleted after accessed");
                 // sm.display = tmp;
@@ -1619,7 +1965,7 @@ impl Sheet {
                     .take(1)
                     .for_each(|(p, d)| {
                         d.display = Some(
-                            Const::Error(CellError::ReferenceLoop {
+                            ConstType::Error(CellError::ReferenceLoop {
                                 loop_point: Some(*p),
                             })
                             .into(),
@@ -1670,26 +2016,28 @@ impl Function for If {
         func: &SheetFunc,
         spec: &SpecValues,
     ) -> Const {
-        let e = Const::Error(CellError::BadArgument {
+        let e = ConstType::Error(CellError::BadArgument {
             cell: None,
             cursor: 4,
             expected_types: vec!["bool".into(), "any".into(), "any".into()],
-        });
+        })
+        .into();
         let [c, y, n] = &args[..] else {
             return e;
         };
         let cval = c.eval(data, eval, func, spec);
-        if matches!(cval.as_ref(), Const::Error(_)) {
+        if matches!(cval.as_ref().ct, ConstType::Error(_)) {
             return cval.into_owned();
         }
-        let Const::Bool(c) = cval.as_ref() else {
-            return Const::Error(CellError::BadArgument {
+        let ConstType::Bool(c) = cval.as_ref().ct else {
+            return ConstType::Error(CellError::BadArgument {
                 cell: None,
                 cursor: 0,
                 expected_types: vec!["bool".into()],
-            });
+            })
+            .into();
         };
-        if *c {
+        if c {
             y.eval(data, eval, func, spec).into_owned()
         } else {
             n.eval(data, eval, func, spec).into_owned()
@@ -1715,13 +2063,18 @@ impl Function for Sum {
         let mut s = 0.0;
         println!("Sum args");
         // dbg!(&args);
-        let e = Const::Error(CellError::BadArgument {
+        let e = ConstType::Error(CellError::BadArgument {
             cell: Some(spec.to_sloc()),
             cursor: 0,
             expected_types: vec!["Cell or range...".into()],
-        });
+        })
+        .into();
         for a in args {
-            if let Value::Const(Const::Range(r)) = a {
+            if let Value::Const(Const {
+                ct: ConstType::Range(r),
+                ..
+            }) = a
+            {
                 // dbg!(data);
                 if let Some(value) = sum_range(data, r, eval, spec, func, &mut s) {
                     return value;
@@ -1729,20 +2082,20 @@ impl Function for Sum {
             } else {
                 let c = a.eval(data, eval, func, spec);
                 dbg!(&c);
-                if let Const::Num(n) = c.as_ref() {
+                if let ConstType::Num(n) = c.ct {
                     s += n;
-                } else if let Const::Range(r) = c.as_ref() {
-                    if let Some(value) = sum_range(data, r, eval, spec, func, &mut s) {
+                } else if let ConstType::Range(r) = &c.as_ref().ct {
+                    if let Some(value) = sum_range(data, &r, eval, spec, func, &mut s) {
                         return value;
                     }
-                } else if let Const::Error(_) = c.as_ref() {
+                } else if let ConstType::Error(_) = c.as_ref().ct {
                     return c.into_owned();
                 } else {
                     return e;
                 }
             }
         }
-        Const::Num(s)
+        ConstType::Num(s).into()
     }
 
     fn get_refs(
@@ -1758,7 +2111,11 @@ impl Function for Sum {
             .flat_map(|a| a.get_refs(data, eval, func, spec))
             .collect();
         refs.extend(args.iter().flat_map(|a| {
-            if let Value::Const(Const::Range(r)) = a {
+            if let Value::Const(Const {
+                ct: ConstType::Range(r),
+                ..
+            }) = a
+            {
                 vec![r.clone()]
             } else {
                 a.get_refs(data, eval, func, spec)
@@ -1783,20 +2140,20 @@ fn sum_range(
             Ok(v) => v,
             Err(e) => match e {
                 CellError::MissingCell { cell: _ } => continue,
-                _ => return Some(Const::Error(e)),
+                _ => return Some(ConstType::Error(e).into()),
             },
         };
         // dbg!(v);
         let Ok(v) = v.val.parse::<Value>() else {
-            return Some(Const::Error(CellError::MissingCell { cell: Some(*elem) }));
+            return Some(ConstType::Error(CellError::MissingCell { cell: Some(*elem) }).into());
         };
         let new_spec = spec.clone().with_sloc(*elem);
         // dbg!(&new_spec);
         let cv = v.eval(data, eval, func, &new_spec);
-        if let Const::Num(n) = cv.as_ref() {
+        if let ConstType::Num(n) = cv.as_ref().ct {
             *s += n;
-        } else if let Const::Error(err) = cv.as_ref() {
-            return Some(Const::Error(err.clone()));
+        } else if let ConstType::Error(_) = &cv.as_ref().ct {
+            return Some(cv.into_owned());
         }
     }
     None
@@ -1817,60 +2174,65 @@ impl Function for ValueFunc {
         spec: &SpecValues,
     ) -> Const {
         let [c, r] = args else {
-            return Const::Error(CellError::WrongNumArguments {
+            return ConstType::Error(CellError::WrongNumArguments {
                 cell: Some((spec.dC, spec.dR)),
                 cursor: 0,
                 arguments: vec![2],
-            });
+            })
+            .into();
         };
         let c = c.eval(data, eval, func, spec);
-        let Const::Num(c) = c.as_ref() else {
-            if let Const::Error(_) = c.as_ref() {
+        let ConstType::Num(c) = c.as_ref().ct else {
+            if let ConstType::Error(_) = c.as_ref().ct {
                 return c.into_owned();
             } else {
-                return Const::Error(CellError::BadArgument {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some((spec.dC, spec.dR)),
                     cursor: 0,
                     expected_types: vec!["Number".into()],
-                });
+                })
+                .into();
             }
         };
         let r = r.eval(data, eval, func, spec);
-        let Const::Num(r) = r.as_ref() else {
-            if let Const::Error(_) = r.as_ref() {
+        let ConstType::Num(r) = r.as_ref().ct else {
+            if let ConstType::Error(_) = r.as_ref().ct {
                 return r.into_owned();
             } else {
-                return Const::Error(CellError::BadArgument {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some((spec.dC, spec.dR)),
                     cursor: 1,
                     expected_types: vec!["Number".into()],
-                });
+                })
+                .into();
             }
         };
         // TODO make this more rigid, find good way to do a let else
-        if c < &0. || c != &c.round() || r < &0. || &r.round() != r {
-            return Const::Error(CellError::BadArgument {
+        if c < 0. || c != c.round() || r < 0. || r.round() != r {
+            return ConstType::Error(CellError::BadArgument {
                 cell: Some((spec.dC, spec.dR)),
                 cursor: 0,
                 expected_types: vec!["whole number".into()],
-            });
+            })
+            .into();
         }
-        let c = *c as i32;
-        let r = *r as i32;
+        let c = c as i32;
+        let r = r as i32;
 
         let rf = data.get(&(c, r), &eval);
         if let Err(e) = rf {
-            return Const::Error(e);
+            return ConstType::Error(e).into();
         }
         let rf = rf.expect("Already handled err case");
         let val = match rf.val.parse::<Value>() {
             Ok(v) => v,
             Err(e) => {
-                return Const::Error(CellError::InvalidFormula {
+                return ConstType::Error(CellError::InvalidFormula {
                     cell: Some((c, r)),
                     cursor: 0,
                     reason: e,
                 })
+                .into()
             }
         };
         let new_spec = spec.clone().with_sloc((c, r));
@@ -1893,19 +2255,19 @@ impl Function for ValueFunc {
             return refs;
         };
         let c = c.eval(data, eval, func, spec);
-        let Const::Num(c) = c.as_ref() else {
+        let ConstType::Num(c) = c.as_ref().ct else {
             return refs;
         };
         let r = r.eval(data, eval, func, spec);
-        let Const::Num(r) = r.as_ref() else {
+        let ConstType::Num(r) = r.as_ref().ct else {
             return refs;
         };
         // TODO make this more rigid, find good way to do a let else
-        if c < &0. || c != &c.round() || r < &0. || &r.round() != r {
+        if c < 0. || c != c.round() || r < 0. || r.round() != r {
             return refs;
         }
-        let c = *c as i32;
-        let r = *r as i32;
+        let c = c as i32;
+        let r = r as i32;
         refs.push((&(c, r)).into());
         refs
     }
@@ -1928,18 +2290,24 @@ impl Function for CountIf {
     ) -> Const {
         let mut count = 0;
         let [range, cond] = args else {
-            return Const::Error(CellError::WrongNumArguments {
+            return ConstType::Error(CellError::WrongNumArguments {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 arguments: vec![2],
-            });
+            })
+            .into();
         };
-        let Value::Const(Const::Range(r)) = range else {
-            return Const::Error(CellError::BadArgument {
+        let Value::Const(Const {
+            ct: ConstType::Range(r),
+            ..
+        }) = range
+        else {
+            return ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Range".into()],
-            });
+            })
+            .into();
         };
         // dbg!(cond);
         for cell in data.keys().filter(|k| r.in_range(k)) {
@@ -1949,11 +2317,12 @@ impl Function for CountIf {
             let inner_spec = spec.clone().with_sloc(*cell);
             let val = celldata.val.parse::<Value>();
             if let Err(val) = val {
-                return Const::Error(CellError::InvalidFormula {
+                return ConstType::Error(CellError::InvalidFormula {
                     cell: Some(inner_spec.to_sloc()),
                     cursor: 0,
                     reason: val,
-                });
+                })
+                .into();
             }
             let val = val.unwrap();
             let cval = val.eval(data, eval, func, &inner_spec).into_owned();
@@ -1961,11 +2330,11 @@ impl Function for CountIf {
             let fspec = spec.clone().with_f_sloc(Some((*cell, cval)));
             // dbg!(spec, &fspec);
 
-            if let Const::Bool(true) = cond.eval(data, eval, func, &fspec).as_ref() {
+            if let ConstType::Bool(true) = cond.eval(data, eval, func, &fspec).as_ref().ct {
                 count += 1;
             };
         }
-        Const::Num(count as f64)
+        ConstType::Num(count as f64).into()
     }
 
     fn get_refs(
@@ -1980,7 +2349,11 @@ impl Function for CountIf {
             .iter()
             .flat_map(|a| a.get_refs(data, eval, func, spec))
             .collect();
-        let Value::Const(Const::Range(r)) = &args[0] else {
+        let Value::Const(Const {
+            ct: ConstType::Range(r),
+            ..
+        }) = &args[0]
+        else {
             return refs;
         };
         refs.push(r.clone());
@@ -2006,42 +2379,42 @@ impl Function for RangeFunc {
             .collect();
         if let [c, r] = args {
             let c = c.eval(data, eval, func, spec);
-            let Const::Num(c) = c.as_ref() else {
+            let ConstType::Num(c) = c.as_ref().ct else {
                 return refs;
             };
             let r = r.eval(data, eval, func, spec);
-            let Const::Num(r) = r.as_ref() else {
+            let ConstType::Num(r) = r.as_ref().ct else {
                 return refs;
             };
             // TODO make this more rigid, find good way to do a let else
-            if c < &0. || c != &c.round() || r < &0. || &r.round() != r {
+            if c < 0. || c != c.round() || r < 0. || r.round() != r {
                 return refs;
             }
-            let c = *c as i32;
-            let r = *r as i32;
+            let c = c as i32;
+            let r = r as i32;
             refs.push(Range::from(&(c, r)).into_inf());
             refs
         } else if let [c1, r1, c2, r2] = args {
             let c1 = c1.eval(data, eval, func, spec);
-            let Const::Num(c1) = c1.as_ref() else {
+            let ConstType::Num(c1) = c1.as_ref().ct else {
                 return refs;
             };
             let r1 = r1.eval(data, eval, func, spec);
-            let Const::Num(r1) = r1.as_ref() else {
+            let ConstType::Num(r1) = r1.as_ref().ct else {
                 return refs;
             };
             // TODO make this more rigid, find good way to do a let else
-            if c1 < &0. || c1 != &c1.round() || r1 < &0. || &r1.round() != r1 {
+            if c1 < 0. || c1 != c1.round() || r1 < 0. || r1.round() != r1 {
                 return refs;
             }
-            let c1 = *c1 as i32;
-            let r1 = *r1 as i32;
+            let c1 = c1 as i32;
+            let r1 = r1 as i32;
             let c2 = c2.eval(data, eval, func, spec);
-            let Ok(c2) = TryInto::<Bound>::try_into(c2.as_ref()) else {
+            let Ok(c2) = TryInto::<Bound>::try_into(&c2.as_ref().ct) else {
                 return refs;
             };
             let r2 = r2.eval(data, eval, func, spec);
-            let Ok(r2) = TryInto::<Bound>::try_into(r2.as_ref()) else {
+            let Ok(r2) = TryInto::<Bound>::try_into(&r2.as_ref().ct) else {
                 return refs;
             };
             refs.push(Range((c1, r1), SLocBound(c2, r2)));
@@ -2065,109 +2438,175 @@ impl Function for RangeFunc {
     ) -> Const {
         if let [c, r] = args {
             let c = c.eval(data, eval, func, spec);
-            let Const::Num(c) = c.as_ref() else {
-                return Const::Error(CellError::BadArgument {
+            let ConstType::Num(c) = c.as_ref().ct else {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some(spec.to_sloc()),
                     cursor: 0,
                     expected_types: vec!["Number".into()],
-                });
+                })
+                .into();
             };
             let r = r.eval(data, eval, func, spec);
-            let Const::Num(r) = r.as_ref() else {
-                return Const::Error(CellError::BadArgument {
+            let ConstType::Num(r) = r.as_ref().ct else {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some(spec.to_sloc()),
                     cursor: 1,
                     expected_types: vec!["Number".into()],
-                });
+                })
+                .into();
             };
             // TODO make this more rigid, find good way to do a let else
-            if c < &0. || c != &c.round() || r < &0. || &r.round() != r {
-                return Const::Error(CellError::BadArgument {
+            if c < 0. || c != c.round() || r < 0. || r.round() != r {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some(spec.to_sloc()),
                     cursor: 0,
                     expected_types: vec!["Whole number".into()],
-                });
+                })
+                .into();
             }
-            let c = *c as i32;
-            let r = *r as i32;
-            Const::Range(Range::range_inf((c, r)))
+            let c = c as i32;
+            let r = r as i32;
+            ConstType::Range(Range::range_inf((c, r))).into()
         } else if let [c1, r1, c2, r2] = args {
             let c1 = c1.eval(data, eval, func, spec);
-            let Const::Num(c1) = c1.as_ref() else {
-                return Const::Error(CellError::BadArgument {
+            let ConstType::Num(c1) = c1.as_ref().ct else {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some(spec.to_sloc()),
                     cursor: 0,
                     expected_types: vec!["Number".into()],
-                });
+                })
+                .into();
             };
             let r1 = r1.eval(data, eval, func, spec);
-            let Const::Num(r1) = r1.as_ref() else {
-                return Const::Error(CellError::BadArgument {
+            let ConstType::Num(r1) = r1.as_ref().ct else {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some(spec.to_sloc()),
                     cursor: 1,
                     expected_types: vec!["Number".into()],
-                });
+                })
+                .into();
             };
             // TODO make this more rigid, find good way to do a let else
-            if c1 < &0. || c1 != &c1.round() || r1 < &0. || &r1.round() != r1 {
-                return Const::Error(CellError::BadArgument {
+            if c1 < 0. || c1 != c1.round() || r1 < 0. || r1.round() != r1 {
+                return ConstType::Error(CellError::BadArgument {
                     cell: Some(spec.to_sloc()),
                     cursor: 0,
                     expected_types: vec!["Whole number".into()],
-                });
+                })
+                .into();
             }
-            let c1 = *c1 as i32;
-            let r1 = *r1 as i32;
+            let c1 = c1 as i32;
+            let r1 = r1 as i32;
             let c2 = c2.eval(data, eval, func, spec);
-            let c2 = match TryInto::<Bound>::try_into(c2.as_ref()) {
+            let c2 = match TryInto::<Bound>::try_into(&c2.as_ref().ct) {
                 Ok(b) => b,
-                Err(e) => return e.into_pos(spec.to_sloc()),
+                Err(e) => return e.into_pos(spec.to_sloc()).into(),
             };
             let r2 = r2.eval(data, eval, func, spec);
-            let r2 = match TryInto::<Bound>::try_into(r2.as_ref()) {
+            let r2 = match TryInto::<Bound>::try_into(&r2.as_ref().ct) {
                 Ok(b) => b,
-                Err(e) => return e.into_pos(spec.to_sloc()),
+                Err(e) => return e.into_pos(spec.to_sloc()).into(),
             };
-            Const::Range(Range((c1, r1), SLocBound(c2, r2)))
+            ConstType::Range(Range((c1, r1), SLocBound(c2, r2))).into()
         } else {
-            Const::Error(CellError::WrongNumArguments {
+            ConstType::Error(CellError::WrongNumArguments {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 arguments: vec![2, 4],
             })
+            .into()
         }
     }
 }
+#[derive(Default)]
+pub(crate) struct ColorFunc;
+impl Function for ColorFunc {
+    fn name(&self) -> &'static str {
+        "color"
+    }
 
+    fn call(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        spec: &SpecValues,
+    ) -> Const {
+        let e = ConstType::Error(CellError::BadArgument {
+            cell: None,
+            cursor: 4,
+            expected_types: vec!["any".into(), "bool".into(), "color".into()],
+        })
+        .into();
+        let [v, c, color] = &args[..] else {
+            return e;
+        };
+        let cval = c.eval(data, eval, func, spec);
+        if matches!(cval.as_ref().ct, ConstType::Error(_)) {
+            return cval.into_owned();
+        }
+        let ConstType::Bool(c) = cval.as_ref().ct else {
+            return ConstType::Error(CellError::BadArgument {
+                cell: None,
+                cursor: 1,
+                expected_types: vec!["bool".into()],
+            })
+            .into();
+        };
+        let colorval = color.eval(data, eval, func, spec);
+        if matches!(colorval.as_ref().ct, ConstType::Error(_)) {
+            return colorval.into_owned();
+        }
+        let ConstType::Color(colorc) = colorval.as_ref().ct else {
+            return ConstType::Error(CellError::BadArgument {
+                cell: None,
+                cursor: 2,
+                expected_types: vec!["color".into()],
+            })
+            .into();
+        };
+        let mut vval = v.eval(data, eval, func, spec).into_owned();
+        if c {
+            vval.bgcolor = colorc;
+            vval
+        } else {
+            vval
+        }
+    }
+}
 #[cfg(test)]
 mod test {
 
     use crate::formula::*;
 
     #[test]
-    fn const_parse() {
-        assert_eq!(Const::from_str("true"), Ok(Const::Bool(true)));
-        assert_eq!(Const::from_str("7"), Ok(Const::Num(7.0)));
-        assert_eq!(Const::from_str("7.5"), Ok(Const::Num(7.5)));
-        assert_eq!(Const::from_str("-7.5"), Ok(Const::Num(-7.5)));
-        assert_eq!(Const::from_str("-7.5e"), Err(()));
-        assert_eq!(Const::from_str("\"Hi\""), Ok(Const::String("Hi".into())));
-        assert_eq!(Const::from_str("\"Hi"), Err(()));
-        assert_eq!(Const::from_str("Hi\""), Err(()));
-        assert_eq!(Const::from_str("abcd"), Err(()));
-
-        assert_eq!(Const::Num(1.).merge_err(&Const::Num(2.)), None);
+    fn const_type_parse() {
+        assert_eq!(ConstType::from_str("true"), Ok(ConstType::Bool(true)));
+        assert_eq!(ConstType::from_str("7"), Ok(ConstType::Num(7.0)));
+        assert_eq!(ConstType::from_str("7.5"), Ok(ConstType::Num(7.5)));
+        assert_eq!(ConstType::from_str("-7.5"), Ok(ConstType::Num(-7.5)));
+        assert_eq!(ConstType::from_str("-7.5e"), Err(()));
         assert_eq!(
-            Const::Error(CellError::ReferenceLoop {
+            ConstType::from_str("\"Hi\""),
+            Ok(ConstType::String("Hi".into()))
+        );
+        assert_eq!(ConstType::from_str("\"Hi"), Err(()));
+        assert_eq!(ConstType::from_str("Hi\""), Err(()));
+        assert_eq!(ConstType::from_str("abcd"), Err(()));
+
+        assert_eq!(ConstType::Num(1.).merge_err(&ConstType::Num(2.)), None);
+        assert_eq!(
+            ConstType::Error(CellError::ReferenceLoop {
                 loop_point: Some((0, 0))
             })
-            .merge_err(&Const::Num(2.)),
+            .merge_err(&ConstType::Num(2.).into()),
             Some(CellError::ReferenceLoop {
                 loop_point: Some((0, 0))
             })
         );
         assert_eq!(
-            Const::Num(2.).merge_err(&Const::Error(CellError::ReferenceLoop {
+            ConstType::Num(2.).merge_err(&ConstType::Error(CellError::ReferenceLoop {
                 loop_point: Some((0, 0))
             })),
             Some(CellError::ReferenceLoop {
@@ -2175,10 +2614,10 @@ mod test {
             })
         );
         assert_eq!(
-            Const::Error(CellError::ReferenceLoop {
+            ConstType::Error(CellError::ReferenceLoop {
                 loop_point: Some((0, 0))
             })
-            .merge_err(&Const::Error(CellError::ReferenceLoop {
+            .merge_err(&ConstType::Error(CellError::ReferenceLoop {
                 loop_point: Some((1, 0))
             })),
             Some(CellError::ReferenceLoop {
@@ -2212,6 +2651,13 @@ mod test {
             ))
         );
         assert_eq!(
+            is_range("ACC1:ABCZ12345"),
+            Some(Range(
+                (756, 0),
+                SLocBound(Bound::Fin(19031), Bound::Fin(12344))
+            ))
+        );
+        assert_eq!(
             is_range("A1:"),
             Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Inf)))
         );
@@ -2235,10 +2681,12 @@ mod test {
         assert_eq!(is_range("A3:A1"), None,);
         assert_eq!(is_range("B1:A1"), None,);
         assert_eq!(is_range("B3:A"), None,);
+        assert_eq!(is_range("B3:1"), None,);
         assert_eq!(is_range("ABCDE0:ABCZZ1"), None,);
         assert_eq!(is_range("ABC3:ABK1"), None,);
         assert_eq!(is_range("SUS1:AMO1"), None,);
         assert_eq!(is_range("NGU3:S"), None,);
+        assert_eq!(is_range("ABCD420:69"), None);
 
         assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(2, 2)));
         assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(2, 3)));
@@ -2391,7 +2839,7 @@ mod test {
     fn formula_parse() {
         assert_eq!(
             form_tree(&split_parens(&form_tokens("78")).unwrap()),
-            (Value::Const(Const::Num(78.)), false),
+            (Value::Const(ConstType::Num(78.).into()), false),
         );
         assert_eq!(
             form_tree(&split_parens(&form_tokens("A5")).unwrap()),
@@ -2405,7 +2853,7 @@ mod test {
                         Rc::new(Value::Ref((0, 6))),
                         Rc::new(Value::Ref((2, 4)))
                     )),
-                    Rc::new(Value::Const(Const::Num(3.)))
+                    Rc::new(Value::Const(ConstType::Num(3.).into()))
                 ),
                 false
             ),
@@ -2414,13 +2862,13 @@ mod test {
             form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap()),
             (
                 Value::Add(
-                    Rc::new(Value::Const(Const::Num(5.))),
+                    Rc::new(Value::Const(ConstType::Num(5.).into())),
                     Rc::new(Value::Func {
                         name: "sum".into(),
-                        args: vec![Value::Const(Const::Range(Range(
-                            (0, 0),
-                            SLocBound(Bound::Fin(0), Bound::Inf)
-                        )))]
+                        args: vec![Value::Const(
+                            ConstType::Range(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
+                                .into()
+                        )]
                     })
                 ),
                 false
@@ -2430,13 +2878,13 @@ mod test {
             form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap()),
             (
                 Value::Add(
-                    Rc::new(Value::Const(Const::Num(5.))),
+                    Rc::new(Value::Const(ConstType::Num(5.).into())),
                     Rc::new(Value::Func {
                         name: "sum".into(),
-                        args: vec![Value::Const(Const::Range(Range(
-                            (0, 0),
-                            SLocBound(Bound::Fin(0), Bound::Inf)
-                        )))]
+                        args: vec![Value::Const(
+                            ConstType::Range(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
+                                .into()
+                        )]
                     })
                 ),
                 false
@@ -2448,9 +2896,9 @@ mod test {
                 Value::Func {
                     name: "range".into(),
                     args: vec![
-                        Value::Const(Const::Num(1.)),
-                        Value::Const(Const::Num(1.)),
-                        Value::Const(Const::Num(5.)),
+                        Value::Const(ConstType::Num(1.).into()),
+                        Value::Const(ConstType::Num(1.).into()),
+                        Value::Const(ConstType::Num(5.).into()),
                         Value::Ref((0, 2))
                     ]
                 },
@@ -2468,16 +2916,19 @@ mod test {
                         Value::Lt(
                             Rc::new(Value::Func {
                                 name: "sum".into(),
-                                args: vec![Value::Const(Const::Range(Range(
-                                    (0, 0),
-                                    SLocBound(Bound::Fin(1), Bound::Inf)
-                                )))]
+                                args: vec![Value::Const(
+                                    ConstType::Range(Range(
+                                        (0, 0),
+                                        SLocBound(Bound::Fin(1), Bound::Inf)
+                                    ))
+                                    .into()
+                                )]
                             }),
-                            Rc::new(Value::Const(Const::Num(20.)))
+                            Rc::new(Value::Const(ConstType::Num(20.).into()))
                         ),
-                        Value::Const(Const::Num(20.)),
-                        Value::Const(Const::String("Small".into())),
-                        // Value::Const(Const::Num(30.))
+                        Value::Const(ConstType::Num(20.).into()),
+                        Value::Const(ConstType::String("Small".into()).into()),
+                        // Value::Const(ConstType::Num(30.).into())
                     ]
                 },
                 false
@@ -2492,14 +2943,36 @@ mod test {
                         Value::Func {
                             name: "range".into(),
                             args: vec![
-                                Value::Const(Const::Num(0.)),
-                                Value::Const(Const::Num(0.)),
-                                Value::Const(Const::Num(10.)),
-                                Value::Const(Const::Num(10.)),
+                                Value::Const(ConstType::Num(0.).into()),
+                                Value::Const(ConstType::Num(0.).into()),
+                                Value::Const(ConstType::Num(10.).into()),
+                                Value::Const(ConstType::Num(10.).into()),
                             ]
                         },
-                        Value::Const(Const::Num(20.)),
-                        // Value::Const(Const::Num(30.))
+                        Value::Const(ConstType::Num(20.).into()),
+                        // Value::Const(ConstType::Num(30.).into())
+                    ]
+                },
+                false
+            ),
+        );
+        assert_eq!(
+            form_tree(
+                &split_parens(&dbg!(form_tokens(
+                    "if(3<1, \"\\\\String1\", \"S2\\\\\\\"\")"
+                )))
+                .unwrap()
+            ),
+            (
+                Value::Func {
+                    name: "if".into(),
+                    args: vec![
+                        Value::Lt(
+                            Rc::new(Value::Const(ConstType::Num(3.).into())),
+                            Rc::new(Value::Const(ConstType::Num(1.).into()))
+                        ),
+                        Value::Const(ConstType::String("\\String1".into()).into()),
+                        Value::Const(ConstType::String("S2\\\"".into()).into()),
                     ]
                 },
                 false
@@ -2515,10 +2988,10 @@ mod test {
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2530,21 +3003,24 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Range(Range((1, 1), SLocBound(Bound::Fin(3), Bound::Fin(3))))
+            ConstType::Range(Range((1, 1), SLocBound(Bound::Fin(3), Bound::Fin(3)))).into()
         );
         assert_eq!(
             RangeFunc.get_refs(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
@@ -2554,20 +3030,23 @@ mod test {
         );
         assert_eq!(
             RangeFunc.call(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf)))
+            ConstType::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))).into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2579,25 +3058,29 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::WrongNumArguments {
+            ConstType::Error(CellError::WrongNumArguments {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 arguments: vec![2, 4]
             })
+            .into()
         );
 
         assert_eq!(
             RangeFunc.get_refs(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
@@ -2607,17 +3090,23 @@ mod test {
         );
         assert_eq!(
             RangeFunc.call(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf)))
+            ConstType::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))).into()
         );
         assert_eq!(
             RangeFunc.get_refs(
-                &[Value::Const(Const::Num(-1.)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(-1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
@@ -2627,21 +3116,28 @@ mod test {
         );
         assert_eq!(
             RangeFunc.call(
-                &[Value::Const(Const::Num(-1.)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(-1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
-                &[Value::Const(Const::Num(1.6)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.6).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
@@ -2651,21 +3147,28 @@ mod test {
         );
         assert_eq!(
             RangeFunc.call(
-                &[Value::Const(Const::Num(1.6)), Value::Const(Const::Num(1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.6).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.6)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.6).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
@@ -2675,21 +3178,28 @@ mod test {
         );
         assert_eq!(
             RangeFunc.call(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(1.6)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.6).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(-1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(-1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
@@ -2699,26 +3209,30 @@ mod test {
         );
         assert_eq!(
             RangeFunc.call(
-                &[Value::Const(Const::Num(1.)), Value::Const(Const::Num(-1.)),],
+                &[
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(-1.).into()),
+                ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
 
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(-1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(-1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2730,29 +3244,30 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(-1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(-1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.6)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.6).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2764,29 +3279,30 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.6)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.6).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.6)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.6).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2798,29 +3314,30 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.6)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.6).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(-1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(-1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2832,29 +3349,30 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(-1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(-1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(-3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(-3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2866,29 +3384,30 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(-3.)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(-3.).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into(), ".I".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.6)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.6).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2900,29 +3419,30 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.6)),
-                    Value::Const(Const::Num(3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.6).into()),
+                    Value::Const(ConstType::Num(3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into(), ".I".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.6))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.6).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2934,29 +3454,30 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(3.6))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(3.6).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into(), ".I".into()]
             })
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(-3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(-3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
@@ -2968,21 +3489,22 @@ mod test {
         assert_eq!(
             RangeFunc.call(
                 &[
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(1.)),
-                    Value::Const(Const::Num(3.)),
-                    Value::Const(Const::Num(-3.))
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(1.).into()),
+                    Value::Const(ConstType::Num(3.).into()),
+                    Value::Const(ConstType::Num(-3.).into())
                 ],
                 &sheet.0,
                 &mut sheet.1,
                 &sheet.2,
                 &spec
             ),
-            Const::Error(CellError::BadArgument {
+            ConstType::Error(CellError::BadArgument {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["Whole number".into(), ".I".into()]
             })
+            .into()
         );
     }
     #[test]
@@ -3027,7 +3549,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "2".into(),
-                display: Some("2".into()),
+                display: Some(ConstType::Num(2.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3036,7 +3558,7 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3045,7 +3567,7 @@ mod test {
             sheet.get(&(1, 0)),
             Ok(&CellData {
                 val: "=A1+A2".into(),
-                display: Some("5".into()),
+                display: Some(ConstType::Num(5.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3068,7 +3590,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "2".into(),
-                display: Some("2".into()),
+                display: Some(ConstType::Num(2.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3077,7 +3599,7 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3086,7 +3608,7 @@ mod test {
             sheet.get(&(1, 0)),
             Ok(&CellData {
                 val: "=sum(A1:A10)".into(),
-                display: Some("5".into()),
+                display: Some(ConstType::Num(5.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3108,7 +3630,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "2".into(),
-                display: Some("2".into()),
+                display: Some(ConstType::Num(2.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3117,7 +3639,7 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3126,7 +3648,7 @@ mod test {
             sheet.get(&(1, 0)),
             Ok(&CellData {
                 val: "=if(A1<A2, A2, A1)".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3149,7 +3671,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3158,7 +3680,7 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3167,7 +3689,7 @@ mod test {
             sheet.get(&(1, 0)),
             Ok(&CellData {
                 val: "=if(A1<A2, A2, A1)".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3190,7 +3712,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3199,17 +3721,28 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
         );
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(d.val, "=9e9e9");
-        assert!(d
-            .display
-            .as_ref()
-            .is_some_and(|f| f.contains("InvalidFormula")));
+        // assert!(d
+        //     .display
+        //     .as_ref()
+        //     .is_some_and(|f| f.contains("InvalidFormula")));
+        assert!(matches!(
+            d.display,
+            Some(Const {
+                ct: ConstType::Error(CellError::InvalidFormula {
+                    cell: _,
+                    cursor: _,
+                    reason: _
+                }),
+                ..
+            })
+        ));
 
         assert!(sheet
             .insert(
@@ -3228,7 +3761,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3237,17 +3770,28 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
         );
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(d.val, "=");
-        assert!(d
-            .display
-            .as_ref()
-            .is_some_and(|f| f.contains("InvalidFormula")));
+        // assert!(d
+        //     .display
+        //     .as_ref()
+        //     .is_some_and(|f| f.contains("InvalidFormula")));
+        assert!(matches!(
+            d.display,
+            Some(Const {
+                ct: ConstType::Error(CellError::InvalidFormula {
+                    cell: _,
+                    cursor: _,
+                    reason: _
+                }),
+                ..
+            })
+        ));
 
         assert!(sheet
             .insert(
@@ -3265,7 +3809,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3274,13 +3818,13 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
         );
         let d = sheet.get(&(1, 0)).unwrap();
-        assert_eq!(d.display, Some("13".into()));
+        assert_eq!(d.display, Some(ConstType::Num(13.).into()));
 
         assert!(sheet
             .insert(
@@ -3309,7 +3853,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3318,7 +3862,7 @@ mod test {
             sheet.get(&(1, 1)),
             Ok(&CellData {
                 val: "-1".into(),
-                display: Some("-1".into()),
+                display: Some(ConstType::Num(-1.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3326,14 +3870,14 @@ mod test {
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(
             d.display,
-            Some(format!(
-                "{:?}",
-                CellError::BadArgument {
+            Some(Const {
+                ct: ConstType::Error(CellError::BadArgument {
                     cell: Some((1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
-                }
-            ))
+                }),
+                ..Const::default_err()
+            })
         );
         assert!(sheet
             .insert(
@@ -3351,7 +3895,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3360,7 +3904,7 @@ mod test {
             sheet.get(&(1, 1)),
             Ok(&CellData {
                 val: "0.6".into(),
-                display: Some("0.6".into()),
+                display: Some(ConstType::Num(0.6).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3368,14 +3912,14 @@ mod test {
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(
             d.display,
-            Some(format!(
-                "{:?}",
-                CellError::BadArgument {
+            Some(Const {
+                ct: ConstType::Error(CellError::BadArgument {
                     cell: Some((1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
-                }
-            ))
+                }),
+                ..Const::default_err()
+            })
         );
 
         assert!(sheet
@@ -3405,7 +3949,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3414,7 +3958,7 @@ mod test {
             sheet.get(&(1, 1)),
             Ok(&CellData {
                 val: "-1".into(),
-                display: Some("-1".into()),
+                display: Some(ConstType::Num(-1.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3422,14 +3966,14 @@ mod test {
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(
             d.display,
-            Some(format!(
-                "{:?}",
-                CellError::BadArgument {
+            Some(Const {
+                ct: ConstType::Error(CellError::BadArgument {
                     cell: Some((1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
-                }
-            ))
+                }),
+                ..Const::default_err()
+            })
         );
         assert!(sheet
             .insert(
@@ -3447,7 +3991,7 @@ mod test {
             sheet.get(&(0, 0)),
             Ok(&CellData {
                 val: "=7".into(),
-                display: Some("7".into()),
+                display: Some(ConstType::Num(7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             })
@@ -3456,7 +4000,7 @@ mod test {
             sheet.get(&(1, 1)),
             Ok(&CellData {
                 val: "0.6".into(),
-                display: Some("0.6".into()),
+                display: Some(ConstType::Num(0.6).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
@@ -3464,14 +4008,14 @@ mod test {
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(
             d.display,
-            Some(format!(
-                "{:?}",
-                CellError::BadArgument {
+            Some(Const {
+                ct: ConstType::Error(CellError::BadArgument {
                     cell: Some((1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
-                }
-            ))
+                }),
+                ..Const::default_err()
+            })
         );
 
         assert!(sheet
@@ -3491,7 +4035,7 @@ mod test {
             d,
             &CellData {
                 val: "=if(A1<A2 & B2<A2, A2, B2)*2".into(),
-                display: Some("1.2".into()),
+                display: Some(ConstType::Num(1.2).into()),
                 dependants: HashSet::new(),
                 rangef: None
             }
@@ -3513,7 +4057,7 @@ mod test {
             d,
             &CellData {
                 val: "=if(A1<A2 & B2<A2, A2, B2)*2".into(),
-                display: Some("6".into()),
+                display: Some(ConstType::Num(6.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             }
@@ -3545,7 +4089,7 @@ mod test {
             d,
             &CellData {
                 val: "=countif(A1:A10, .F.<4)".into(),
-                display: Some("2".into()),
+                display: Some(ConstType::Num(2.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             }
@@ -3567,7 +4111,7 @@ mod test {
             d,
             &CellData {
                 val: "=countif(A1:A10, .F.<2)".into(),
-                display: Some("1".into()),
+                display: Some(ConstType::Num(1.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             }
@@ -3590,12 +4134,12 @@ mod test {
             d,
             &CellData {
                 val: "=countif(A1:B10, .F.<2)".into(),
-                display: Some(format!(
-                    "{:?}",
-                    CellError::ReferenceLoop {
+                display: Some(
+                    ConstType::Error(CellError::ReferenceLoop {
                         loop_point: Some((1, 0))
-                    }
-                )),
+                    })
+                    .into()
+                ),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             }
@@ -3612,13 +4156,16 @@ mod test {
                 rangef: None
             }
         );
-        sheet.set_disp(&(1, 0), Some("Not error".into()));
+        sheet.set_disp(
+            &(1, 0),
+            Some(ConstType::from_str("\"Not error\"").unwrap().into()),
+        );
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData {
                 val: "=countif(A1:B10, .F.<2)".into(),
-                display: Some("Not error".into()),
+                display: Some(ConstType::String("Not error".into()).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             }
@@ -3634,12 +4181,12 @@ mod test {
             d,
             &CellData {
                 val: "=countif(A1:B10, .F.<2)".into(),
-                display: Some(format!(
-                    "{:?}",
-                    CellError::MissingCell {
+                display: Some(Const {
+                    ct: ConstType::Error(CellError::MissingCell {
                         cell: Some((100, 100))
-                    }
-                )),
+                    }),
+                    ..Const::default_err()
+                }),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             }
@@ -3652,7 +4199,7 @@ mod test {
             d,
             &CellData {
                 val: "=countif(A1:A10, .F.=4)-7".into(),
-                display: Some("-7".into()),
+                display: Some(ConstType::Num(-7.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             }
@@ -3664,7 +4211,7 @@ mod test {
             d,
             &CellData {
                 val: "=countif(A1:A10, .F.=1)/2".into(),
-                display: Some("0.5".into()),
+                display: Some(ConstType::Num(0.5).into()),
                 dependants: HashSet::new(),
                 rangef: None
             }
@@ -3676,7 +4223,7 @@ mod test {
             d,
             &CellData {
                 val: "=value(0,1)".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: HashSet::new(),
                 rangef: None
             }
@@ -3685,30 +4232,73 @@ mod test {
             sheet.get(&(0, 1)),
             Ok(&CellData {
                 val: "3".into(),
-                display: Some("3".into()),
+                display: Some(ConstType::Num(3.).into()),
                 dependants: [(1, 0)].into_iter().collect(),
                 rangef: None
             })
         );
-        dbg!(&sheet);
+        // dbg!(&sheet);
         sheet.remove(&(0, 1));
         sheet.recompute();
-        dbg!(&sheet);
+        // dbg!(&sheet);
         let d = sheet.get(&(1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData {
                 val: "=value(0,1)".into(),
-                display: Some(format!(
-                    "{:?}",
-                    CellError::MissingCell { cell: Some((0, 1)) }
-                )),
+                display: Some(
+                    ConstType::Error(CellError::MissingCell { cell: Some((0, 1)) }).into()
+                ),
                 dependants: HashSet::new(),
                 rangef: None
             }
         );
 
+        sheet.set_val(&(1, 0), "=value(0,1)+value(0,0)+value(1,1)".into());
+        sheet.set_val(&(0, 1), "5".into());
+        sheet.recompute();
+        dbg!(&sheet);
+        assert_eq!(
+            sheet.get(&(1, 0)),
+            Ok(&CellData {
+                val: "=value(0,1)+value(0,0)+value(1,1)".into(),
+                display: Some(ConstType::Num(6.6).into()),
+                dependants: HashSet::new(),
+                rangef: None
+            })
+        );
+
         assert!(sheet.contains_key(&(0, 0)));
         assert!(!sheet.contains_key(&(2, 2)));
+    }
+    #[test]
+    fn recurse() {
+        let mut sheet = Sheet::new();
+        sheet.set_val(&(0, 0), "=A2+1".to_owned());
+        sheet.set_val(&(0, 1), "=B1*2".to_owned());
+        sheet.set_val(&(1, 0), "=A1-1".to_owned());
+        sheet.recompute();
+        // dbg!(&sheet);
+        assert_eq!(
+            sheet.get(&(0, 0)).unwrap().display,
+            Some(
+                ConstType::Error(CellError::ReferenceLoop {
+                    loop_point: Some((0, 0))
+                })
+                .into()
+            )
+        );
+        sheet.set_val(&(1, 0), "=1".to_owned());
+        sheet.recompute();
+        dbg!(&sheet);
+        assert_eq!(
+            sheet.get(&(0, 0)).unwrap().display,
+            Some(ConstType::Num(3.).into())
+        );
+        sheet.set_disp(&(0, 0), Some(ConstType::String("123".into()).into()));
+        assert_eq!(
+            sheet.get(&(0, 0)).unwrap().display,
+            Some(ConstType::String("123".into()).into())
+        );
     }
 }

@@ -9,7 +9,9 @@ use std::{
 };
 
 use flate2::Compression;
-use formula::{show_ref, CellData, CellError, CountIf, Function, If, RangeFunc, Sum, ValueFunc};
+use formula::{
+    show_ref, CellData, CellError, ColorFunc, CountIf, Function, If, RangeFunc, Sum, ValueFunc,
+};
 use sdl2::{
     event::{Event, WindowEvent},
     keyboard::{Keycode, Mod},
@@ -19,11 +21,12 @@ use sdl2::{
     ttf,
 };
 
-use crate::formula::show_col;
+use crate::formula::{show_col, RenderColor};
 
 const BLACK: Color = Color::RGB(20, 20, 20);
 const BLUE: Color = Color::RGB(90, 90, 180);
 const WHITE: Color = Color::RGB(200, 200, 200);
+const RED: Color = Color::RGB(200, 20, 20);
 
 // type Sheet = BTreeMap<(i32, i32), CellData>;
 // whut
@@ -66,9 +69,9 @@ impl std::fmt::Debug for Sheet {
 //     }
 // }
 impl SheetFunc {
-    fn add_func<F: Function + Default + 'static>(&mut self) {
-        self.0.push(Box::new(F::default()))
-    }
+    // fn add_func<F: Function + Default + 'static>(&mut self) {
+    //     self.0.push(Box::new(F::default()))
+    // }
     fn get_func(&self, name: &str) -> Option<&dyn Function> {
         self.0.iter().find(|f| f.name() == name).map(|x| x.as_ref())
     }
@@ -81,6 +84,7 @@ impl Default for SheetFunc {
             Box::new(Sum),
             Box::new(ValueFunc),
             Box::new(CountIf),
+            Box::new(ColorFunc),
         ])
     }
 }
@@ -115,6 +119,10 @@ impl Sheet {
             self.dirty(&c);
         }
         self.0.remove(cell)
+    }
+    fn set_val(&mut self, cell: &SLoc, val: String) {
+        self.0.set_val(cell, val);
+        self.1.insert(*cell, 0);
     }
 }
 impl Deref for Sheet {
@@ -443,6 +451,22 @@ fn main() {
                         }
                     }
                 }
+                Event::MouseButtonUp {
+                    timestamp: _,
+                    window_id: _,
+                    which: _,
+                    mouse_btn,
+                    clicks: _,
+                    x: _,
+                    y: _,
+                } => {
+                    if mouse_btn == MouseButton::Left {
+                        form_select_cursor = None;
+                        form_select_start = None;
+                        form_select_end = None;
+                    }
+                    Dirty::No
+                }
                 Event::MouseMotion {
                     timestamp: _,
                     window_id: _,
@@ -453,7 +477,10 @@ fn main() {
                     xrel: _,
                     yrel: _,
                 } => {
-                    let curc = ((x / cellw), (y - top) / cellh);
+                    let curc = (
+                        ((x + scroll.0) / cellw - 1),
+                        ((y + scroll.1) - top) / cellh - 1,
+                    );
                     if y < top {
                         // TODO menu and clicking into formula
                         Dirty::No
@@ -519,6 +546,9 @@ fn main() {
                                         if cur > 0 && cur <= dp {
                                             dmut.val.remove(cur - 1);
                                             cursor = Some(cur - 1);
+                                            form_select_cursor = None;
+                                            form_select_start = None;
+                                            form_select_end = None;
                                             Dirty::Visual
                                         } else {
                                             Dirty::No
@@ -544,15 +574,15 @@ fn main() {
                             } else if key == Keycode::Down {
                                 selected = Some((x, y + 1));
                                 let r = if cursor.is_some() {
+                                    let _ = data.dirty(&(x, y));
+                                    cursor = None;
                                     Dirty::Recompute
                                 } else {
                                     Dirty::Visual
                                 };
-                                cursor = None;
                                 if (y + 3) * cellh >= height - top + scroll.1 {
                                     scroll.1 = (y + 3 - (height - top) / cellh) * cellh;
                                 }
-                                let _ = data.dirty(&(x, y));
                                 r
                             } else if key == Keycode::Left {
                                 if let Some(cpos) = cursor {
@@ -767,7 +797,7 @@ fn main() {
                     if x == 0 && y == 0 {
                         continue;
                     } else if x == 0 {
-                        let Ok(text) = cellfont.render(&show_col(ys)).solid(BLACK) else {
+                        let Ok(text) = cellfont.render(&format!("{}", 1 + ys)).solid(BLACK) else {
                             continue;
                         };
                         let text_text = texturer.create_texture_from_surface(text).unwrap();
@@ -792,7 +822,7 @@ fn main() {
                             .unwrap();
                         continue;
                     } else if y == 0 {
-                        let Ok(text) = cellfont.render(&format!("{}", xs + 1)).solid(BLACK) else {
+                        let Ok(text) = cellfont.render(&show_col(xs)).solid(BLACK) else {
                             continue;
                         };
                         let text_text = texturer.create_texture_from_surface(text).unwrap();
@@ -821,8 +851,8 @@ fn main() {
                         continue;
                     };
                     if s.display.is_some() && Some((xs, ys)) != selected {
-                        let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
-                        else {
+                        // let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
+                        let Ok(text) = cellfont.render_c(s.display.as_ref().unwrap()) else {
                             // If empty string
                             continue;
                         };
@@ -894,15 +924,16 @@ fn main() {
                             // dbg!(e);
                         }
                     }
-                    match cellfont
-                        .render(if cursor.is_some() {
-                            &s.val
-                        } else {
-                            s.display.as_ref().map(|x| x as &str).unwrap_or("")
-                        })
-                        .solid(BLACK)
-                    {
-                        Ok(text) => {
+
+                    let text_res = if cursor.is_some() {
+                        cellfont.render(&s.val).solid(BLACK).ok()
+                    } else if s.display.is_some() {
+                        cellfont.render_c(s.display.as_ref().unwrap()).ok()
+                    } else {
+                        None
+                    };
+                    match text_res {
+                        Some(text) => {
                             let text_text = texturer.create_texture_from_surface(text).unwrap();
                             let sm = text_text.query();
                             select_box(
@@ -929,7 +960,7 @@ fn main() {
                                 )
                                 .unwrap();
                         }
-                        Err(_) => {
+                        None => {
                             select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
                         }
                     }
@@ -1027,6 +1058,6 @@ mod test {
     #[test]
     fn sheet_func() {
         let sheet = Sheet::new();
-        assert_eq!(sheet.2.iter().count(), 5);
+        assert_eq!(sheet.2.iter().count(), 6);
     }
 }
