@@ -10,7 +10,8 @@ use std::{
 
 use flate2::Compression;
 use formula::{
-    show_ref, CellData, CellError, ColorFunc, CountIf, Function, If, RangeFunc, Sum, ValueFunc,
+    get_range_form, show_ref, AndFunc, CellData, CellError, ColorFunc, CountIf, FalseFunc,
+    Function, If, OrFunc, Range, RangeFunc, SLocBound, Sum, TrueFunc, ValueFunc,
 };
 use sdl2::{
     event::{Event, WindowEvent},
@@ -35,21 +36,23 @@ pub(crate) type SLoc = (i32, i32);
 pub(crate) struct SheetData(BTreeMap<SLoc, CellData>);
 pub(crate) type SheetEval = BTreeMap<SLoc, usize>;
 pub(crate) struct SheetFunc(Vec<Box<dyn Function>>);
+pub(crate) type SheetRanges = HashSet<Range>;
 impl SheetFunc {
     fn iter(&self) -> impl Iterator<Item = &Box<dyn Function>> {
         self.0.iter()
     }
 }
 
-struct Sheet(
-    pub(crate) SheetData,
-    pub(crate) SheetEval,
-    pub(crate) SheetFunc,
-);
+struct Sheet {
+    data: SheetData,
+    eval: SheetEval,
+    funcs: SheetFunc,
+    ranges: SheetRanges,
+}
 impl std::fmt::Debug for Sheet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)?;
-        for v in self.2.iter() {
+        write!(f, "{:?}", self.data)?;
+        for v in self.funcs.iter() {
             write!(f, "{},", v.name())?;
         }
         Ok(())
@@ -85,29 +88,47 @@ impl Default for SheetFunc {
             Box::new(ValueFunc),
             Box::new(CountIf),
             Box::new(ColorFunc),
+            Box::new(AndFunc),
+            Box::new(OrFunc),
+            Box::new(TrueFunc),
+            Box::new(FalseFunc),
         ])
     }
 }
 impl Sheet {
     fn new() -> Self {
-        Self(
-            SheetData(BTreeMap::new()),
-            BTreeMap::new(),
-            SheetFunc::default(),
-        )
+        Self {
+            data: SheetData(BTreeMap::new()),
+            eval: BTreeMap::new(),
+            funcs: SheetFunc::default(),
+            ranges: HashSet::default(),
+        }
     }
     fn get(&self, cell: &SLoc) -> Result<&CellData, CellError> {
-        self.0.get(cell, &self.1)
+        self.data.get(cell, &self.eval)
+    }
+    fn get_val(&self, cell: &SLoc) -> Result<&str, CellError> {
+        let cd = self.get(cell)?;
+        if cd.rangeform {
+            let origin = get_range_form(&self.ranges, cell)?;
+            if let Some(origin) = origin {
+                Ok(&self.get(origin)?.val)
+            } else {
+                Err(CellError::MissingCell { cell: Some(*cell) })
+            }
+        } else {
+            Ok(&cd.val)
+        }
     }
     fn get_mut(&mut self, cell: &SLoc) -> Result<&mut CellData, CellError> {
-        self.0.get_mut(cell, &self.1)
+        self.data.get_mut(cell, &self.eval)
     }
     fn insert(&mut self, cell: SLoc, val: CellData) -> Option<CellData> {
-        self.1.insert(cell.clone(), 0);
-        self.0.insert(cell, val)
+        self.eval.insert(cell, 0);
+        self.data.insert(cell, val)
     }
     fn val_mut(&mut self, cell: &SLoc) -> Option<&mut String> {
-        self.0.val_mut(cell)
+        self.data.val_mut(cell)
     }
     fn remove(&mut self, cell: &SLoc) {
         let Ok(cd) = self.get(cell) else {
@@ -118,23 +139,23 @@ impl Sheet {
         for c in to_update.into_iter() {
             self.dirty(&c);
         }
-        self.0.remove(cell)
+        self.data.remove(cell)
     }
     fn set_val(&mut self, cell: &SLoc, val: String) {
-        self.0.set_val(cell, val);
-        self.1.insert(*cell, 0);
+        self.data.set_val(cell, val);
+        self.eval.insert(*cell, 0);
     }
 }
 impl Deref for Sheet {
     type Target = SheetData;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.data
     }
 }
 impl DerefMut for Sheet {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.data
     }
 }
 impl SheetData {
@@ -251,6 +272,7 @@ no loops of two cells with []
 [,.I]=filter(col(.C-1), .F.<20) will fill the column will values in the first that are less than 20. use filter without range to do findif
 string splitting can be done automatically as well
 [5,.I]=split(value(.SC-1,.R), " "), which will put the first 6 words in the column to the left into different columns on the right
+need to pass some form of visibility to do empty range formula cells
 
 Dragging prediction
 if arithmetic or geometric, continue the pattern
@@ -274,6 +296,15 @@ file picker (rfd)
 idk what else a menu needs
 
 header row that is sticky
+
+cell reference highlights.
+hash function for ranges that maps them to hue.
+
+cell formatting, esp for numbers
+
+import and export to excel
+
+charts and graphs
 */
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -363,10 +394,7 @@ fn main() {
                 };
                 for (j, entry) in line.iter().enumerate() {
                     if !entry.is_empty() {
-                        data.insert(
-                            (j as i32, i as i32),
-                            CellData::from_str(&entry.to_owned()).unwrap(),
-                        );
+                        data.insert((j as i32, i as i32), CellData::from_str(entry).unwrap());
                     }
                 }
             }
@@ -413,42 +441,40 @@ fn main() {
                     if y < top {
                         // TODO menu and clicking into formula
                         Dirty::No
-                    } else {
-                        if let Some(cur) = cursor {
-                            if let Some(s) = selected {
-                                form_select_start = Some(new);
+                    } else if let Some(cur) = cursor {
+                        if let Some(s) = selected {
+                            form_select_start = Some(new);
 
-                                let show = show_ref(&new);
-                                form_select_cursor = Some(cur..cur + show.len());
-                                cursor = Some(cur + show.len());
-                                // dbg!(&show);
-                                if let Some(v) = data.val_mut(&s) {
-                                    v.insert_str(cur, &show);
-                                    Dirty::Visual
-                                } else {
-                                    Dirty::No
-                                }
+                            let show = show_ref(&new);
+                            form_select_cursor = Some(cur..cur + show.len());
+                            cursor = Some(cur + show.len());
+                            // dbg!(&show);
+                            if let Some(v) = data.val_mut(&s) {
+                                v.insert_str(cur, &show);
+                                Dirty::Visual
                             } else {
                                 Dirty::No
                             }
                         } else {
-                            let t = if selected == Some(new) {
-                                println!("1");
-                                Dirty::No
-                            } else if new.0 >= 0 && new.1 >= 0 {
-                                println!("2");
-                                selected = Some(new);
-                                Dirty::Visual
-                            } else {
-                                println!("3");
-                                selected = None;
-                                cursor = None;
-                                Dirty::Visual
-                            };
-
-                            dbg!(selected);
-                            t
+                            Dirty::No
                         }
+                    } else {
+                        let t = if selected == Some(new) {
+                            println!("1");
+                            Dirty::No
+                        } else if new.0 >= 0 && new.1 >= 0 {
+                            println!("2");
+                            selected = Some(new);
+                            Dirty::Visual
+                        } else {
+                            println!("3");
+                            selected = None;
+                            cursor = None;
+                            Dirty::Visual
+                        };
+
+                        dbg!(selected);
+                        t
                     }
                 }
                 Event::MouseButtonUp {
@@ -484,37 +510,35 @@ fn main() {
                     if y < top {
                         // TODO menu and clicking into formula
                         Dirty::No
-                    } else {
-                        if let (Some(s), Some(start), Some(form_cur)) =
-                            (selected, form_select_start, form_select_cursor.clone())
-                        {
-                            if Some(curc) != form_select_end {
-                                println!("{curc:?}");
-                                form_select_end = Some(curc);
+                    } else if let (Some(s), Some(start), Some(form_cur)) =
+                        (selected, form_select_start, form_select_cursor.clone())
+                    {
+                        if Some(curc) != form_select_end {
+                            println!("{curc:?}");
+                            form_select_end = Some(curc);
 
-                                let shows = show_ref(&start);
-                                let showe = show_ref(&curc);
-                                println!("{}:{}", shows, showe);
-                                if let Some(v) = data.val_mut(&s) {
-                                    if curc > start {
-                                        let rang = format!("{}:{}", shows, showe);
-                                        form_select_cursor =
-                                            Some(form_cur.start..form_cur.start + rang.len());
-                                        cursor = Some(form_cur.start + rang.len());
-                                        v.replace_range(form_cur, &rang);
-                                        Dirty::Visual
-                                    } else if curc < start {
+                            let shows = show_ref(&start);
+                            let showe = show_ref(&curc);
+                            println!("{}:{}", shows, showe);
+                            if let Some(v) = data.val_mut(&s) {
+                                match curc.cmp(&start) {
+                                    std::cmp::Ordering::Less => {
                                         let rang = format!("{}:{}", showe, shows);
                                         form_select_cursor =
                                             Some(form_cur.start..form_cur.start + rang.len());
                                         cursor = Some(form_cur.start + rang.len());
                                         v.replace_range(form_cur, &rang);
                                         Dirty::Visual
-                                    } else {
-                                        Dirty::No
                                     }
-                                } else {
-                                    Dirty::No
+                                    std::cmp::Ordering::Equal => Dirty::No,
+                                    std::cmp::Ordering::Greater => {
+                                        let rang = format!("{}:{}", shows, showe);
+                                        form_select_cursor =
+                                            Some(form_cur.start..form_cur.start + rang.len());
+                                        cursor = Some(form_cur.start + rang.len());
+                                        v.replace_range(form_cur, &rang);
+                                        Dirty::Visual
+                                    }
                                 }
                             } else {
                                 Dirty::No
@@ -522,6 +546,8 @@ fn main() {
                         } else {
                             Dirty::No
                         }
+                    } else {
+                        Dirty::No
                     }
                 }
                 Event::KeyDown {
@@ -557,14 +583,14 @@ fn main() {
                                         Dirty::No
                                     }
                                 } else {
-                                    let _ = data.dirty(&(x, y));
+                                    data.dirty(&(x, y));
                                     data.remove(&(x, y));
                                     Dirty::Recompute
                                 }
                                 // dbg!(&data.get(&(x, y)).unwrap());
                             } else if key == Keycode::Return {
                                 if cursor.is_some() {
-                                    let _ = data.dirty(&(x, y));
+                                    data.dirty(&(x, y));
                                     selected = Some((x, y + 1));
                                     cursor = None;
                                 } else {
@@ -574,7 +600,7 @@ fn main() {
                             } else if key == Keycode::Down {
                                 selected = Some((x, y + 1));
                                 let r = if cursor.is_some() {
-                                    let _ = data.dirty(&(x, y));
+                                    data.dirty(&(x, y));
                                     cursor = None;
                                     Dirty::Recompute
                                 } else {
@@ -582,8 +608,10 @@ fn main() {
                                 };
                                 if (y + 3) * cellh >= height - top + scroll.1 {
                                     scroll.1 = (y + 3 - (height - top) / cellh) * cellh;
+                                    Dirty::Recompute
+                                } else {
+                                    r
                                 }
-                                r
                             } else if key == Keycode::Left {
                                 if let Some(cpos) = cursor {
                                     if cpos == 0 {
@@ -599,8 +627,10 @@ fn main() {
                                     selected = Some(((x - 1).max(0), y));
                                     if (x - 1) * cellw < scroll.0 {
                                         scroll.0 = (x - 1).max(0) * cellw;
+                                        Dirty::Recompute
+                                    } else {
+                                        Dirty::Visual
                                     }
-                                    Dirty::Visual
                                 }
                             } else if key == Keycode::Right {
                                 if let Some(cpos) = cursor {
@@ -623,16 +653,20 @@ fn main() {
                                     selected = Some((x + 1, y));
                                     if (x + 3) * cellw > width + scroll.0 {
                                         scroll.0 = (x + 3 - width / cellw) * cellw;
+                                        Dirty::Recompute
+                                    } else {
+                                        Dirty::Visual
                                     }
-                                    Dirty::Visual
                                 }
                             } else if key == Keycode::Up {
                                 selected = Some((x, (y - 1).max(0)));
                                 cursor = None;
                                 if (y - 1) * cellh < scroll.1 {
                                     scroll.1 = (y - 1).max(0) * cellh;
+                                    Dirty::Recompute
+                                } else {
+                                    Dirty::Visual
                                 }
-                                Dirty::Visual
                             } else if key == Keycode::Escape {
                                 if cursor.is_some() {
                                     if let Some(fc) = form_select_cursor.clone() {
@@ -659,12 +693,10 @@ fn main() {
                             } else {
                                 Dirty::No
                             }
+                        } else if key == Keycode::Escape {
+                            break 'main;
                         } else {
-                            if key == Keycode::Escape {
-                                break 'main;
-                            } else {
-                                Dirty::No
-                            }
+                            Dirty::No
                         }
                     } else {
                         Dirty::No
@@ -683,7 +715,7 @@ fn main() {
                         }
                         // data.get_mut(&(x, y)).unwrap().push_str(&text);
                         if let Some(cpos) = cursor {
-                            data.val_mut(&(x, y)).unwrap().insert_str(cpos, &text);
+                            dbg!(data.val_mut(&(x, y))).unwrap().insert_str(cpos, &text);
                             cursor = Some(cpos + text.len());
                             form_select_cursor = None;
                             form_select_start = None;
@@ -732,9 +764,6 @@ fn main() {
         // println!("{framecount}");
         if dirty != Dirty::No {
             dbg!(cursor);
-            if dirty == Dirty::Recompute {
-                data.recompute();
-            }
 
             canvas.set_draw_color(WHITE);
             canvas.clear();
@@ -742,7 +771,7 @@ fn main() {
             let cell_scroll_x = scroll.0 / cellw;
             let cell_scroll_y = scroll.1 / cellh;
 
-            let h34 = (height - top) as i32;
+            let h34 = height - top;
             canvas.set_draw_color(BLACK);
             canvas
                 .fill_rect(Rect::new(
@@ -760,6 +789,133 @@ fn main() {
                     border.try_into().unwrap(),
                 ))
                 .unwrap();
+
+            if dirty == Dirty::Recompute {
+                // data.recompute();
+                data.recompute_range(Range(
+                    (cell_scroll_x, cell_scroll_y),
+                    SLocBound(
+                        formula::Bound::Fin(cell_scroll_x + width / cellw),
+                        formula::Bound::Fin(cell_scroll_y + h34 / cellh),
+                    ),
+                ));
+            }
+
+            // Render cells
+            for x in 0..=(width / cellw) {
+                for y in 0..=(h34 / cellh) {
+                    let (xs, ys) = (x + cell_scroll_x - 1, y + cell_scroll_y - 1);
+                    if x == 0 && y == 0 {
+                        continue;
+                    } else if x == 0 {
+                        // render row numbers
+                        let Ok(text) = cellfont.render(&format!("{}", 1 + ys)).solid(BLACK) else {
+                            continue;
+                        };
+                        let text_text = texturer.create_texture_from_surface(text).unwrap();
+                        let sm = text_text.query();
+                        let (copyw, copyh) = { (cellw as u32, cellh as u32) };
+                        canvas
+                            .copy(
+                                &text_text,
+                                Some(Rect::new(
+                                    0,
+                                    0,
+                                    (copyw).min(sm.width),
+                                    (copyh).min(sm.height),
+                                )),
+                                Some(Rect::new(
+                                    (x) * cellw,
+                                    top + (y) * cellh - scroll.1.rem_euclid(cellh),
+                                    (copyw).min(sm.width),
+                                    (copyh).min(sm.height),
+                                )),
+                            )
+                            .unwrap();
+                        continue;
+                    } else if y == 0 {
+                        // Render column numbers
+                        let Ok(text) = cellfont.render(&show_col(xs)).solid(BLACK) else {
+                            continue;
+                        };
+                        let text_text = texturer.create_texture_from_surface(text).unwrap();
+                        let sm = text_text.query();
+                        let (copyw, copyh) = { (cellw as u32, cellh as u32) };
+                        canvas
+                            .copy(
+                                &text_text,
+                                Some(Rect::new(
+                                    0,
+                                    0,
+                                    (copyw).min(sm.width),
+                                    (copyh).min(sm.height),
+                                )),
+                                Some(Rect::new(
+                                    ((x) * cellw - scroll.0.rem_euclid(cellw)).max(cellw),
+                                    top + (y) * cellh,
+                                    (copyw).min(sm.width),
+                                    (copyh).min(sm.height),
+                                )),
+                            )
+                            .unwrap();
+                        continue;
+                    } else {
+                        // render cells that are not being typed in
+                        if Some((xs, ys)) != selected || cursor.is_none() {
+                            let Some(s) = data.get_display(&(xs, ys)) else {
+                                continue;
+                            };
+                            // let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
+                            let Ok(text) = cellfont.render_c(&s) else {
+                                // If empty string
+                                continue;
+                            };
+                            let text_text = texturer.create_texture_from_surface(text).unwrap();
+                            let sm = text_text.query();
+                            let (copyw, copyh) = { (cellw as u32, cellh as u32) };
+                            canvas
+                                .copy(
+                                    &text_text,
+                                    Some(Rect::new(
+                                        0,
+                                        0,
+                                        (copyw).min(sm.width).min(if x == 1 {
+                                            (cellw - scroll.0.rem_euclid(cellw)) as u32
+                                        } else {
+                                            u32::MAX
+                                        }),
+                                        (copyh).min(sm.height).min(if y == 1 {
+                                            (cellh - scroll.1.rem_euclid(cellh)) as u32
+                                        } else {
+                                            u32::MAX
+                                        }),
+                                    )),
+                                    Some(Rect::new(
+                                        ((x) * cellw - scroll.0.rem_euclid(cellw)).max(cellw),
+                                        top + (y) * cellh
+                                            - if y == 1 {
+                                                0
+                                            } else {
+                                                scroll.1.rem_euclid(cellh)
+                                            },
+                                        (copyw).min(sm.width).min(if x == 1 {
+                                            (cellw - scroll.0.rem_euclid(cellw)) as u32
+                                        } else {
+                                            u32::MAX
+                                        }),
+                                        (copyh).min(sm.height).min(if y == 1 {
+                                            (cellh - scroll.1.rem_euclid(cellh)) as u32
+                                        } else {
+                                            u32::MAX
+                                        }),
+                                    )),
+                                )
+                                .unwrap();
+                        }
+                    }
+                }
+            }
+
             for i in 2..=(h34 / cellh) {
                 // horizontal lines
                 canvas
@@ -791,119 +947,11 @@ fn main() {
                     .unwrap();
             }
 
-            for x in 0..=(width / cellw) {
-                for y in 0..=(h34 / cellh) {
-                    let (xs, ys) = (x + cell_scroll_x - 1, y + cell_scroll_y - 1);
-                    if x == 0 && y == 0 {
-                        continue;
-                    } else if x == 0 {
-                        let Ok(text) = cellfont.render(&format!("{}", 1 + ys)).solid(BLACK) else {
-                            continue;
-                        };
-                        let text_text = texturer.create_texture_from_surface(text).unwrap();
-                        let sm = text_text.query();
-                        let (copyw, copyh) = { (cellw as u32, cellh as u32) };
-                        canvas
-                            .copy(
-                                &text_text,
-                                Some(Rect::new(
-                                    0,
-                                    0,
-                                    (copyw).min(sm.width),
-                                    (copyh).min(sm.height),
-                                )),
-                                Some(Rect::new(
-                                    (x) * cellw,
-                                    top + (y) * cellh - scroll.1.rem_euclid(cellh),
-                                    (copyw).min(sm.width),
-                                    (copyh).min(sm.height),
-                                )),
-                            )
-                            .unwrap();
-                        continue;
-                    } else if y == 0 {
-                        let Ok(text) = cellfont.render(&show_col(xs)).solid(BLACK) else {
-                            continue;
-                        };
-                        let text_text = texturer.create_texture_from_surface(text).unwrap();
-                        let sm = text_text.query();
-                        let (copyw, copyh) = { (cellw as u32, cellh as u32) };
-                        canvas
-                            .copy(
-                                &text_text,
-                                Some(Rect::new(
-                                    0,
-                                    0,
-                                    (copyw).min(sm.width),
-                                    (copyh).min(sm.height),
-                                )),
-                                Some(Rect::new(
-                                    ((x) * cellw - scroll.0.rem_euclid(cellw)).max(cellw),
-                                    top + (y) * cellh,
-                                    (copyw).min(sm.width),
-                                    (copyh).min(sm.height),
-                                )),
-                            )
-                            .unwrap();
-                        continue;
-                    }
-                    let Ok(s) = data.get(&(xs, ys)) else {
-                        continue;
-                    };
-                    if s.display.is_some() && Some((xs, ys)) != selected {
-                        // let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
-                        let Ok(text) = cellfont.render_c(s.display.as_ref().unwrap()) else {
-                            // If empty string
-                            continue;
-                        };
-                        let text_text = texturer.create_texture_from_surface(text).unwrap();
-                        let sm = text_text.query();
-                        let (copyw, copyh) = { (cellw as u32, cellh as u32) };
-                        canvas
-                            .copy(
-                                &text_text,
-                                Some(Rect::new(
-                                    0,
-                                    0,
-                                    (copyw).min(sm.width).min(if x == 1 {
-                                        (cellw - scroll.0.rem_euclid(cellw)) as u32
-                                    } else {
-                                        u32::MAX
-                                    }),
-                                    (copyh).min(sm.height).min(if y == 1 {
-                                        (cellh - scroll.1.rem_euclid(cellh)) as u32
-                                    } else {
-                                        u32::MAX
-                                    }),
-                                )),
-                                Some(Rect::new(
-                                    ((x) * cellw - scroll.0.rem_euclid(cellw)).max(cellw),
-                                    top + (y) * cellh
-                                        - if y == 1 {
-                                            0
-                                        } else {
-                                            scroll.1.rem_euclid(cellh)
-                                        },
-                                    (copyw).min(sm.width).min(if x == 1 {
-                                        (cellw - scroll.0.rem_euclid(cellw)) as u32
-                                    } else {
-                                        u32::MAX
-                                    }),
-                                    (copyh).min(sm.height).min(if y == 1 {
-                                        (cellh - scroll.1.rem_euclid(cellh)) as u32
-                                    } else {
-                                        u32::MAX
-                                    }),
-                                )),
-                            )
-                            .unwrap();
-                    }
-                }
-            }
-
             if let Some((x, y)) = selected {
-                if let Ok(s) = data.get(&(x, y)) {
-                    match mainfont.render(&s.val).solid(BLACK) {
+                // if let Some(s) = data.get_display(&(x, y)) {
+                // Render edit box text
+                if let Ok(sd) = data.get(&(x, y)) {
+                    match mainfont.render(&sd.val).solid(BLACK) {
                         Ok(text) => {
                             let text_text = texturer.create_texture_from_surface(text).unwrap();
                             let sm = text_text.query();
@@ -924,49 +972,57 @@ fn main() {
                             // dbg!(e);
                         }
                     }
+                }
 
-                    let text_res = if cursor.is_some() {
-                        cellfont.render(&s.val).solid(BLACK).ok()
-                    } else if s.display.is_some() {
-                        cellfont.render_c(s.display.as_ref().unwrap()).ok()
+                // Cell box render
+                let text_res = if let Ok(sd) = data.get(&(x, y)) {
+                    if cursor.is_some() {
+                        cellfont.render(&sd.val).solid(BLACK).ok()
+                    } else if let Some(d) = &sd.display {
+                        let mut d = d.clone();
+                        d.bgcolor = BLUE.rgb();
+                        cellfont.render_c(&d).ok()
                     } else {
                         None
-                    };
-                    match text_res {
-                        Some(text) => {
-                            let text_text = texturer.create_texture_from_surface(text).unwrap();
-                            let sm = text_text.query();
-                            select_box(
-                                &mut canvas,
-                                x,
-                                cellw,
-                                border,
-                                y,
-                                cellh,
-                                top,
-                                sm.width.checked_sub(cellw as u32).map(|x| x + 4),
-                                scroll,
-                            );
-                            canvas
-                                .copy(
-                                    &text_text,
-                                    None,
-                                    Some(Rect::new(
-                                        (x + 1) * cellw - scroll.0 + border / 2,
-                                        (y + 1) * cellh - scroll.1 + border / 2 + top,
-                                        sm.width,
-                                        cellh.try_into().unwrap(),
-                                    )),
-                                )
-                                .unwrap();
-                        }
-                        None => {
-                            select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
-                        }
                     }
                 } else {
-                    select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
+                    None
+                };
+                match text_res {
+                    Some(text) => {
+                        let text_text = texturer.create_texture_from_surface(text).unwrap();
+                        let sm = text_text.query();
+                        select_box(
+                            &mut canvas,
+                            x,
+                            cellw,
+                            border,
+                            y,
+                            cellh,
+                            top,
+                            sm.width.checked_sub(cellw as u32).map(|x| x + 4),
+                            scroll,
+                        );
+                        canvas
+                            .copy(
+                                &text_text,
+                                None,
+                                Some(Rect::new(
+                                    (x + 1) * cellw - scroll.0 + border / 2,
+                                    (y + 1) * cellh - scroll.1 + border / 2 + top,
+                                    sm.width,
+                                    cellh.try_into().unwrap(),
+                                )),
+                            )
+                            .unwrap();
+                    }
+                    None => {
+                        select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
+                    }
                 }
+                // } else {
+                //     select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
+                // }
             }
 
             if let Some(cpos) = cursor {
@@ -1026,6 +1082,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_box(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     x: i32,
@@ -1053,11 +1110,23 @@ fn select_box(
 
 #[cfg(test)]
 mod test {
+    use std::{fs::File, io::Read};
+
     use crate::Sheet;
 
     #[test]
     fn sheet_func() {
         let sheet = Sheet::new();
-        assert_eq!(sheet.2.iter().count(), 6);
+        let avail = {
+            let mut f = File::open("src/formula.rs").unwrap();
+            let mut b = String::new();
+            f.read_to_string(&mut b).unwrap();
+            b.split("impl Function for").count() - 1
+        };
+        assert!(
+            sheet.funcs.iter().count() >= avail,
+            "Missing formulas from formula not imported, missing {}",
+            avail - sheet.funcs.iter().count()
+        );
     }
 }

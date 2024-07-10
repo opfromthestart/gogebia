@@ -1,0 +1,1 @@
+exclude_re = ["in main", "select_box", "Debug", "replace main"]
