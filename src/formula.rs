@@ -393,6 +393,7 @@ pub(crate) trait RenderColor<T> {
     type Err;
     fn render_c(&self, r: T) -> Result<Surface, Self::Err>;
 }
+#[allow(dead_code)]
 pub(crate) enum RenderError {
     FontError(FontError),
     TextureValueError(TextureValueError),
@@ -784,6 +785,7 @@ impl<'a> ParenTree<'a> {
     }
     fn iter(&self) -> impl Iterator<Item = ParenTree<'a>> {
         match self {
+            #[allow(clippy::unnecessary_to_owned)]
             ParenTree::Paren(p) => p.to_vec().into_iter(),
             ParenTree::Token(_, _) => vec![self.clone()].into_iter(),
         }
@@ -1735,11 +1737,7 @@ impl Value {
                 }
             }
             Value::RangeForm(r) => {
-                if (&r.conditon)
-                    .eval(data, eval, func, ranges, spec)
-                    .ct
-                    .truthy()
-                {
+                if r.conditon.eval(data, eval, func, ranges, spec).ct.truthy() {
                     r.value.eval(data, eval, func, ranges, spec)
                 } else {
                     // Cow::Owned(
@@ -1835,17 +1833,17 @@ impl Bound {
 }
 impl PartialOrd for Bound {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Bound::Fin(a), Bound::Fin(b)) => a.partial_cmp(b),
-            (Bound::Fin(_), Bound::Inf) => Some(std::cmp::Ordering::Less),
-            (Bound::Inf, Bound::Fin(_)) => Some(std::cmp::Ordering::Greater),
-            (Bound::Inf, Bound::Inf) => Some(std::cmp::Ordering::Equal),
-        }
+        Some(self.cmp(other))
     }
 }
 impl Ord for Bound {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+        match (self, other) {
+            (Bound::Fin(a), Bound::Fin(b)) => a.cmp(b),
+            (Bound::Fin(_), Bound::Inf) => std::cmp::Ordering::Less,
+            (Bound::Inf, Bound::Fin(_)) => std::cmp::Ordering::Greater,
+            (Bound::Inf, Bound::Inf) => std::cmp::Ordering::Equal,
+        }
     }
 }
 #[derive(Debug, PartialEq)]
@@ -2001,7 +1999,7 @@ pub(crate) fn get_range_form<'a>(
             source2: *v[1],
         })
     } else {
-        Ok(v.get(0).cloned())
+        Ok(v.first().cloned())
     }
 }
 impl Sheet {
@@ -2095,7 +2093,7 @@ impl Sheet {
         }
         let mut dummies = HashSet::new();
         for sheetrange in self.ranges.iter() {
-            let inter = view_range.intersect(&sheetrange);
+            let inter = view_range.intersect(sheetrange);
 
             let riter: FinRangeIter = match inter.try_into() {
                 Ok(i) => i,
@@ -2225,7 +2223,7 @@ impl Sheet {
                 orphan_cells.push(*pos);
             }
         }
-        kc.retain(|x| orphan_cells.contains(&x));
+        kc.retain(|x| orphan_cells.contains(x));
         // strip mutability
         let kc = kc;
         // dbg!(&self);
