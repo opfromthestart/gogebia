@@ -4,6 +4,7 @@ mod formula;
 use std::{
     collections::{BTreeMap, HashSet},
     ops::{Add, Deref, DerefMut},
+    path::PathBuf,
     str::FromStr,
     time::Duration,
 };
@@ -388,7 +389,17 @@ fn main() {
     let mut form_select_end = None;
     let mut form_select_cursor = None;
 
-    if let Some(filen) = std::env::args().nth(1) {
+    let mut file = std::env::args()
+        .nth(1)
+        .map(|x| PathBuf::from_str(&x).expect("Path not found"));
+    if file.is_none() {
+        file = rfd::FileDialog::new()
+            .set_title("Choose a .gg file")
+            .add_filter("Gogebia", &["gg"])
+            .pick_file();
+    }
+
+    if let Some(filen) = file {
         if let Ok(file_zipped) = std::fs::File::open(filen) {
             let filedata = flate2::read::GzDecoder::new(file_zipped);
             let file = csv::ReaderBuilder::new()
