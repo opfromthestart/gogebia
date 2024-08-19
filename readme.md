@@ -37,6 +37,7 @@ The big feature of this editor is range functions. This does the equivalent of "
 Here is an example of it being used to double the value of the cells of column A.
 
 ![gog8](https://github.com/user-attachments/assets/ef5a3d96-1bef-440b-8b87-0f73f565e9ef)
+
 To avoid the errors in later cells, you can specify if a cell should only be filled in certain cases with `[C,R,COND]=F`, where the cell will only be filled if `COND` is truthy (it is false if the cell is empty, an error, or false).
 
 ![gog8 5](https://github.com/user-attachments/assets/588e5a4f-c594-4a82-b0fe-ceec5c1b85c6)
@@ -44,6 +45,7 @@ To avoid the errors in later cells, you can specify if a cell should only be fil
 These conditions can be any formula. Here is an example that prints a geometric sequence until it reaches 2:
 
 ![gog9](https://github.com/user-attachments/assets/1473f183-2364-46ba-a5e1-134f792fa8e1)
+
 Once B1 is updated, the cells take on their new values, including cells that were previously empty.
 
 ![gog10](https://github.com/user-attachments/assets/fb4c9fef-0911-495b-b99d-f9e7e02e8587)
@@ -51,6 +53,7 @@ Once B1 is updated, the cells take on their new values, including cells that wer
 Here is an example of an amortization table that has all parameters, including number of periods:
 
 ![gog11](https://github.com/user-attachments/assets/8dd9a7b9-eddc-4c1c-a86d-e5e927a3fc24)
+
 When the number of periods changes, so does the number of rows.
 
 ![gog12](https://github.com/user-attachments/assets/7a64d56d-22bb-43de-be7d-415d499e9103)
