@@ -10,8 +10,9 @@ use std::{
 
 use flate2::Compression;
 use formula::{
-    get_range_form, show_ref, AndFunc, CellData, CellError, ColorFunc, CountIf, FalseFunc,
-    Function, If, OrFunc, Range, RangeFunc, SLocBound, Sum, TrueFunc, ValueFunc,
+    get_range_form, show_ref, Acc, AccMode, AndFunc, CeilFunc, CellData, CellError, ColorFunc,
+    CountIf, FalseFunc, Function, If, OrFunc, PowFunc, Range, RangeFunc, RoundFunc, SLocBound,
+    TrueFunc, ValueFunc,
 };
 use sdl2::{
     event::{Event, WindowEvent},
@@ -84,7 +85,8 @@ impl Default for SheetFunc {
         Self(vec![
             Box::new(RangeFunc),
             Box::new(If),
-            Box::new(Sum),
+            Box::new(Acc(AccMode::Sum)),
+            Box::new(Acc(AccMode::Mean)),
             Box::new(ValueFunc),
             Box::new(CountIf),
             Box::new(ColorFunc),
@@ -92,6 +94,9 @@ impl Default for SheetFunc {
             Box::new(OrFunc),
             Box::new(TrueFunc),
             Box::new(FalseFunc),
+            Box::new(RoundFunc),
+            Box::new(CeilFunc),
+            Box::new(PowFunc),
         ])
     }
 }
@@ -352,11 +357,13 @@ fn main() {
 
     // let cellsx: i32 = 20;
     // let cellsy: i32 = 18;
-    let cellw = 120;
-    let cellh: i32 = 30;
+    // let cellw = 120;
+    // let cellh: i32 = 30;
+    let cellw = 90;
+    let cellh: i32 = 25;
     let menu = 48;
     let top: i32 = 96;
-    let border = 4;
+    let border = 2; // 4
     let mut height = 800;
     let mut width = 1200;
     let mut scroll = (0, 0);
@@ -1110,7 +1117,7 @@ fn select_box(
 
 #[cfg(test)]
 mod test {
-    use std::{fs::File, io::Read};
+    use std::{collections::HashSet, fs::File, io::Read};
 
     use crate::Sheet;
 
@@ -1128,5 +1135,12 @@ mod test {
             "Missing formulas from formula not imported, missing {}",
             avail - sheet.funcs.iter().count()
         );
+        let names: HashSet<&str> = [
+            "if", "color", "range", "or", "true", "false", "countif", "sum", "value", "and",
+            "round", "ceil", "power",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(names, sheet.funcs.iter().map(|x| x.name()).collect());
     }
 }
