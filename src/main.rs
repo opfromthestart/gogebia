@@ -311,6 +311,11 @@ cell formatting, esp for numbers
 import and export to excel
 
 charts and graphs
+
+have F4 key turn absolute ref into relative ref
+
+have functions, take arguments as .1., .2., etc, then use call function as
+call(A1, 5,3)
 */
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -388,6 +393,7 @@ fn main() {
     let mut form_select_start = None;
     let mut form_select_end = None;
     let mut form_select_cursor = None;
+    let mut form_select_done = true;
 
     let mut file = std::env::args()
         .nth(1)
@@ -462,6 +468,8 @@ fn main() {
                     } else if let Some(cur) = cursor {
                         if let Some(s) = selected {
                             form_select_start = Some(new);
+                            form_select_done = false;
+                            form_select_end = None;
 
                             let show = show_ref(&new);
                             form_select_cursor = Some(cur..cur + show.len());
@@ -505,9 +513,10 @@ fn main() {
                     y: _,
                 } => {
                     if mouse_btn == MouseButton::Left {
-                        form_select_cursor = None;
-                        form_select_start = None;
-                        form_select_end = None;
+                        // form_select_cursor = None;
+                        // form_select_start = None;
+                        // form_select_end = None;
+                        form_select_done = true;
                     }
                     Dirty::No
                 }
@@ -531,7 +540,7 @@ fn main() {
                     } else if let (Some(s), Some(start), Some(form_cur)) =
                         (selected, form_select_start, form_select_cursor.clone())
                     {
-                        if Some(curc) != form_select_end {
+                        if Some(curc) != form_select_end && !form_select_done {
                             println!("{curc:?}");
                             form_select_end = Some(curc);
 
@@ -708,6 +717,50 @@ fn main() {
                                     selected = None;
                                 }
                                 Dirty::Visual
+                            } else if key == Keycode::F4 {
+                                if let Some(ref fr) = form_select_cursor {
+                                    if let Some(fs) = form_select_start {
+                                        if let Some(fe) = form_select_end {
+                                            let newr = format!(
+                                                "range(.C{:+},.R{:+},.C{:+},.R{:+})",
+                                                fs.0 - x,
+                                                fs.1 - y,
+                                                fe.0 - x,
+                                                fe.1 - y
+                                            );
+                                            if let Some(v) = data.val_mut(&(x, y)) {
+                                                v.replace_range(fr.clone(), &newr);
+                                                form_select_done = true;
+                                                form_select_cursor = None;
+                                                form_select_start = None;
+                                                form_select_end = None;
+                                                Dirty::Visual
+                                            } else {
+                                                Dirty::No
+                                            }
+                                        } else {
+                                            let newr = format!(
+                                                "value(.C{:+},.R{:+})",
+                                                fs.0 - x,
+                                                fs.1 - y,
+                                            );
+                                            if let Some(v) = data.val_mut(&(x, y)) {
+                                                v.replace_range(fr.clone(), &newr);
+                                                form_select_done = true;
+                                                form_select_cursor = None;
+                                                form_select_start = None;
+                                                form_select_end = None;
+                                                Dirty::Visual
+                                            } else {
+                                                Dirty::No
+                                            }
+                                        }
+                                    } else {
+                                        Dirty::No
+                                    }
+                                } else {
+                                    Dirty::No
+                                }
                             } else {
                                 Dirty::No
                             }
