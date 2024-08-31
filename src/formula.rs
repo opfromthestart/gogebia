@@ -22,6 +22,7 @@ pub(crate) enum Spec {
     dFR,
     dI,
     dH(u8, u8, u8),
+    dA(usize),
 }
 #[derive(Clone, Debug)]
 #[allow(non_snake_case)]
@@ -140,6 +141,11 @@ pub(crate) enum CellError {
         cell: Option<SLoc>,
         cursor: usize,
     },
+    InvalidFunction {
+        cell: Option<SLoc>,
+        cursor: usize,
+        reason: &'static str,
+    },
 }
 impl Display for CellError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -227,6 +233,14 @@ impl Display for CellError {
                     write!(f, "Used infinity somewhere bad.")
                 }
             }
+            CellError::InvalidFunction {
+                cell,
+                cursor,
+                reason,
+            } => match cell {
+                Some(c) => write!(f, "Invalid function at {}:{cursor}: {reason}", show_ref(c)),
+                None => write!(f, "Invalid function: {reason}"),
+            },
         }
     }
 }
@@ -322,6 +336,7 @@ pub(crate) enum ConstType {
     Error(CellError),
     Range(Range),
     Color((u8, u8, u8)),
+    Function(Box<Value>),
 }
 impl ConstType {
     fn parse_exact(s: &str) -> Self {
@@ -382,6 +397,9 @@ impl Const {
     fn is_error(&self) -> bool {
         matches!(self.ct, ConstType::Error(_))
     }
+    fn is_function(&self) -> bool {
+        matches!(self.ct, ConstType::Function(_))
+    }
 }
 
 impl From<&ConstType> for String {
@@ -393,6 +411,7 @@ impl From<&ConstType> for String {
             ConstType::Error(e) => format!("{e}"),
             ConstType::Range(_) => "Range is not valid here".to_string(),
             ConstType::Color((r, g, b)) => format!("Color #{r},{g},{b}"),
+            ConstType::Function(_) => format!("Function"),
         }
     }
 }
@@ -527,6 +546,15 @@ impl ConstType {
                     source1,
                     source2,
                 },
+                CellError::InvalidFunction {
+                    cell: None,
+                    cursor,
+                    reason,
+                } => CellError::InvalidFunction {
+                    cell: Some(pos),
+                    cursor,
+                    reason,
+                },
                 _ => e,
             }),
             _ => self,
@@ -540,6 +568,7 @@ impl ConstType {
             ConstType::Error(_) => false,
             ConstType::Range(_) => false,
             ConstType::Color(_) => false,
+            ConstType::Function(_) => false,
         }
     }
     // fn to_pos(&self, pos: SLoc) -> Self {
@@ -1458,6 +1487,9 @@ fn is_spec(token: &str) -> Option<Spec> {
                 }
             }
         }
+        _ if &token[..2] == ".A" => {
+            Some(Spec::dA(token[2..].parse::<usize>().ok()?.checked_sub(1)?))
+        }
         _ => None,
     }
 }
@@ -1484,6 +1516,23 @@ impl FromStr for Value {
 }
 
 impl Value {
+    fn is_function(&self) -> bool {
+        match self {
+            Value::Const(c) => c.is_function(),
+            Value::Ref(_) => false,
+            Value::Special(s) => matches!(s, Spec::dA(_)),
+            Value::Add(l, r)
+            | Value::Sub(l, r)
+            | Value::Mul(l, r)
+            | Value::Div(l, r)
+            | Value::Lt(l, r)
+            | Value::Gt(l, r)
+            | Value::Eq(l, r) => l.is_function() || r.is_function(),
+            Value::Func { name: _, args } => args.iter().any(|a| a.is_function()),
+            Value::RangeForm(_) => false,
+        }
+    }
+
     /// Whenever the `spec` variable changes in a recursive call, depth should be incremented
     fn eval<'a>(
         &'a self,
@@ -1495,6 +1544,9 @@ impl Value {
     ) -> Cow<'a, Const> {
         // ConstType::String("".into().into())
         let l = (spec.dC, spec.dR);
+        if self.is_function() {
+            return Cow::Owned(ConstType::Function(Box::new(self.clone())).into());
+        }
         if eval.get(&l).is_some_and(|x| spec.invalid_depth(*x)) {
             // dbg!(spec, eval.get(&l));
             if let Some(x) = eval.get_mut(&l) {
@@ -1655,6 +1707,7 @@ impl Value {
                         .into(),
                     ),
                     Spec::dH(r, g, b) => Cow::Owned(ConstType::Color((*r, *g, *b)).into()),
+                    Spec::dA(_) => Cow::Owned(ConstType::Function(Box::new(self.clone())).into()),
                 }
             }
             Value::Mul(lhs, rhs) => {
@@ -3490,6 +3543,104 @@ impl Function for PowFunc {
             _ => return arge,
         };
         ConstType::Num(base.powf(exp)).into()
+    }
+}
+
+impl Value {
+    fn replace_args(&self, args: &[Self]) -> Self {
+        match self {
+            Value::Const(_) | Value::Ref(_) => self.clone(),
+            Value::Special(s) => {
+                if let Spec::dA(p) = s {
+                    args.get(*p).cloned().unwrap_or(Self::Const(
+                        ConstType::Error(CellError::WrongNumArguments {
+                            cell: None,
+                            cursor: 0,
+                            arguments: vec![*p + 1],
+                        })
+                        .into(),
+                    ))
+                } else {
+                    self.clone()
+                }
+            }
+            Value::Add(l, r) => {
+                Self::Add(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
+            }
+            Value::Sub(l, r) => {
+                Self::Sub(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
+            }
+            Value::Mul(l, r) => {
+                Self::Mul(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
+            }
+            Value::Div(l, r) => {
+                Self::Div(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
+            }
+            Value::Lt(l, r) => {
+                Self::Lt(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
+            }
+            Value::Gt(l, r) => {
+                Self::Gt(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
+            }
+            Value::Eq(l, r) => {
+                Self::Eq(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
+            }
+            Value::Func { name, args } => Value::Func {
+                name: name.clone(),
+                args: args.iter().map(|a| a.replace_args(args)).collect(),
+            },
+            Value::RangeForm(_) => Self::Const(
+                ConstType::Error(CellError::InvalidFunction {
+                    cell: None,
+                    cursor: 0,
+                    reason: "Cannot use range formula in function",
+                })
+                .into(),
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CallFunc;
+impl Function for CallFunc {
+    fn name(&self) -> &'static str {
+        "call"
+    }
+
+    fn call(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        ranges: &SheetRanges,
+        spec: &SpecValues,
+    ) -> Const {
+        let Some(f) = args.get(0) else {
+            return ConstType::Error(CellError::WrongNumArguments {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                arguments: vec![1, 2, 3, 4],
+            })
+            .into();
+        };
+        let f_eval = f.eval(data, eval, func, ranges, spec);
+        if f_eval.is_error() {
+            return f_eval.into_owned();
+        }
+        let ConstType::Function(f_val) = &f_eval.ct else {
+            return ConstType::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Function".into(), "...".into()],
+            })
+            .into();
+        };
+        f_val
+            .replace_args(&args[1..])
+            .eval(data, eval, func, ranges, spec)
+            .to_pos(spec.to_sloc())
     }
 }
 

@@ -11,9 +11,9 @@ use std::{
 
 use flate2::Compression;
 use formula::{
-    get_range_form, show_ref, Acc, AccMode, AndFunc, CeilFunc, CellData, CellError, ColorFunc,
-    CountIf, FalseFunc, Function, If, OrFunc, PowFunc, Range, RangeFunc, RoundFunc, SLocBound,
-    TrueFunc, ValueFunc,
+    get_range_form, show_ref, Acc, AccMode, AndFunc, CallFunc, CeilFunc, CellData, CellError,
+    ColorFunc, CountIf, FalseFunc, Function, If, OrFunc, PowFunc, Range, RangeFunc, RoundFunc,
+    SLocBound, TrueFunc, ValueFunc,
 };
 use sdl2::{
     event::{Event, WindowEvent},
@@ -98,6 +98,7 @@ impl Default for SheetFunc {
             Box::new(RoundFunc),
             Box::new(CeilFunc),
             Box::new(PowFunc),
+            Box::new(CallFunc),
         ])
     }
 }
@@ -1201,7 +1202,7 @@ mod test {
         );
         let names: HashSet<&str> = [
             "if", "color", "range", "or", "true", "false", "countif", "sum", "value", "and",
-            "round", "ceil", "power",
+            "round", "ceil", "power", "call",
         ]
         .into_iter()
         .collect();
