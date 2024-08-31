@@ -315,7 +315,7 @@ charts and graphs
 
 have F4 key turn absolute ref into relative ref
 
-have functions, take arguments as .1., .2., etc, then use call function as
+have functions, take arguments as .A1., .A2., etc, then use call function as
 call(A1, 5,3)
 */
 
