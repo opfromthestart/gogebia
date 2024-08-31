@@ -3548,8 +3548,15 @@ impl Function for PowFunc {
 
 impl Value {
     fn replace_args(&self, args: &[Self]) -> Self {
+        println!("Replacing {self:?}");
         match self {
-            Value::Const(_) | Value::Ref(_) => self.clone(),
+            Value::Const(c) => match &c.ct {
+                ConstType::Function(f) => {
+                    Value::Const(ConstType::Function(Box::new(f.replace_args(args))).into())
+                }
+                _ => self.clone(),
+            },
+            Value::Ref(_) => self.clone(),
             Value::Special(s) => {
                 if let Spec::dA(p) = s {
                     args.get(*p).cloned().unwrap_or(Self::Const(
@@ -3585,9 +3592,9 @@ impl Value {
             Value::Eq(l, r) => {
                 Self::Eq(Rc::new(l.replace_args(args)), Rc::new(r.replace_args(args)))
             }
-            Value::Func { name, args } => Value::Func {
+            Value::Func { name, args: fargs } => Value::Func {
                 name: name.clone(),
-                args: args.iter().map(|a| a.replace_args(args)).collect(),
+                args: fargs.iter().map(|a| a.replace_args(args)).collect(),
             },
             Value::RangeForm(_) => Self::Const(
                 ConstType::Error(CellError::InvalidFunction {
@@ -3637,8 +3644,7 @@ impl Function for CallFunc {
             })
             .into();
         };
-        f_val
-            .replace_args(&args[1..])
+        dbg!(f_val.replace_args(&args[1..]))
             .eval(data, eval, func, ranges, spec)
             .to_pos(spec.to_sloc())
     }
