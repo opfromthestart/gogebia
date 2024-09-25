@@ -1,5 +1,4 @@
-use core::panic;
-use std::{borrow::Cow, collections::HashSet, fmt::Display, rc::Rc, str::FromStr};
+use std::{borrow::Cow, collections::HashSet, fmt::Display, rc::Rc, str::FromStr, sync::Mutex};
 
 use sdl2::{
     rect::Rect,
@@ -13,13 +12,16 @@ use crate::{SLoc, Sheet, SheetData, SheetEval, SheetFunc, SheetRanges, BLACK, RE
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Spec {
+    dT,
     dC,
     dR,
     dSC,
     dSR,
+    dST,
     dFd,
     dFC,
     dFR,
+    dFT,
     dI,
     dH(u8, u8, u8),
     dA(usize),
@@ -27,53 +29,64 @@ pub(crate) enum Spec {
 #[derive(Clone, Debug)]
 #[allow(non_snake_case)]
 pub(crate) struct SpecValues {
+    dT: &'static str,
     dC: i32,
     dR: i32,
     dSC: Option<i32>,
     dSR: Option<i32>,
+    dST: Option<&'static str>,
     dFd: Option<Const>,
     dFC: Option<i32>,
+    dFT: Option<&'static str>,
     dFR: Option<i32>,
     depth: usize,
 }
 impl SpecValues {
-    fn from_sloc(sloc: SLoc) -> Self {
+    pub(crate) fn from_sloc(sloc: SLoc) -> Self {
         Self {
-            dC: sloc.0,
-            dR: sloc.1,
+            dC: sloc.1,
+            dR: sloc.2,
             dSC: None,
             dSR: None,
             dFd: None,
             dFC: None,
             dFR: None,
             depth: 0,
+            dT: sloc.0,
+            dST: None,
+            dFT: None,
         }
     }
     fn to_sloc(&self) -> SLoc {
-        (self.dC, self.dR)
+        SLoc(self.dT, self.dC, self.dR)
     }
     fn with_sloc(self, sloc: SLoc) -> Self {
         Self {
-            dC: sloc.0,
-            dR: sloc.1,
+            dC: sloc.1,
+            dR: sloc.2,
             depth: self.depth + 1,
             dSC: None,
             dSR: None,
             dFd: None,
             dFC: None,
             dFR: None,
+            dT: sloc.0,
+            dST: None,
+            dFT: None,
         }
     }
     fn with_f_sloc(self, f: Option<(SLoc, Const)>) -> Self {
         match f {
             Some(f) => Self {
-                dFC: Some(f.0 .0),
-                dFR: Some(f.0 .1),
+                dFT: Some(f.0 .0),
+                dFC: Some(f.0 .1),
+                dFR: Some(f.0 .2),
                 dFd: Some(f.1),
                 depth: self.depth + 1,
                 ..self
             },
             None => Self {
+                dFT: None,
                 dFC: None,
                 dFR: None,
                 dFd: None,
@@ -85,12 +98,14 @@ impl SpecValues {
     fn with_s_sloc(self, s: Option<SLoc>) -> Self {
         match s {
             Some(s) => Self {
-                dSC: Some(s.0),
-                dSR: Some(s.1),
+                dST: Some(s.0),
+                dSC: Some(s.1),
+                dSR: Some(s.2),
                 depth: self.depth + 1,
                 ..self
             },
             None => Self {
+                dST: None,
                 dSC: None,
                 dSR: None,
                 depth: self.depth + 1,
@@ -152,7 +167,7 @@ impl Display for CellError {
         match self {
             CellError::ReferenceLoop { loop_point } => {
                 if let Some(c) = loop_point {
-                    write!(f, "Circular reference at {}.", show_ref(c))
+                    write!(f, "Circular reference at {}.", show_ref_global(c))
                 } else {
                     write!(f, "Circular reference at unknown location.")
                 }
@@ -166,7 +181,7 @@ impl Display for CellError {
                     write!(
                         f,
                         "Formula error \"{reason}\" at position {}:{cursor}",
-                        show_ref(c),
+                        show_ref_global(c),
                     )
                 } else {
                     write!(f, "Formula parsing failed on some cell.")
@@ -181,7 +196,7 @@ impl Display for CellError {
                     write!(
                         f,
                         "Expected arguments {expected_types:?} at position {}:{cursor}",
-                        show_ref(c),
+                        show_ref_global(c),
                     )
                 } else {
                     write!(f, "Some bad argument somewhere")
@@ -196,7 +211,7 @@ impl Display for CellError {
                     write!(
                         f,
                         "Needs {arguments:?} arguments at cell {}:{cursor}",
-                        show_ref(c)
+                        show_ref_global(c)
                     )
                 } else {
                     write!(f, "Wrong number of arguments somewhere")
@@ -204,7 +219,7 @@ impl Display for CellError {
             }
             CellError::MissingCell { cell } => {
                 if let Some(c) = cell {
-                    write!(f, "Cell {} missing", show_ref(c),)
+                    write!(f, "Cell {} missing", show_ref_global(c),)
                 } else {
                     write!(f, "Some cell is missing.")
                 }
@@ -218,9 +233,9 @@ impl Display for CellError {
                     write!(
                         f,
                         "Cell {} appears in ranges of {} and {}.",
-                        show_ref(c),
-                        show_ref(source1),
-                        show_ref(source2)
+                        show_ref_global(c),
+                        show_ref_global(source1),
+                        show_ref_global(source2)
                     )
                 } else {
                     write!(f, "Range intersection at unknown cell.")
@@ -228,7 +243,7 @@ impl Display for CellError {
             }
             CellError::InvalidInfinity { cell, cursor } => {
                 if let Some(c) = cell {
-                    write!(f, "Cannot use infinity at {}:{cursor}", show_ref(c))
+                    write!(f, "Cannot use infinity at {}:{cursor}", show_ref_global(c))
                 } else {
                     write!(f, "Used infinity somewhere bad.")
                 }
@@ -238,7 +253,11 @@ impl Display for CellError {
                 cursor,
                 reason,
             } => match cell {
-                Some(c) => write!(f, "Invalid function at {}:{cursor}: {reason}", show_ref(c)),
+                Some(c) => write!(
+                    f,
+                    "Invalid function at {}:{cursor}: {reason}",
+                    show_ref_global(c)
+                ),
                 None => write!(f, "Invalid function: {reason}"),
             },
         }
@@ -252,7 +271,7 @@ pub(crate) struct SLocBound(pub Bound, pub Bound);
 pub(crate) struct Range(pub SLoc, pub SLocBound);
 impl From<&SLoc> for Range {
     fn from(value: &SLoc) -> Self {
-        Self(*value, SLocBound(Bound::Fin(value.0), Bound::Fin(value.1)))
+        Self(*value, SLocBound(Bound::Fin(value.1), Bound::Fin(value.2)))
     }
 }
 #[derive(Debug, PartialEq)]
@@ -270,10 +289,10 @@ impl Iterator for FinRangeIter {
         if self.1 == w * h {
             return None;
         }
-        let rh = self.1 / w + self.0 .0 .1;
-        let rw = self.1 % w + self.0 .0 .0;
+        let rh = self.1 / w + self.0 .0 .2;
+        let rw = self.1 % w + self.0 .0 .1;
         self.1 += 1;
-        Some((rw, rh))
+        Some(SLoc(self.0 .0 .0, rw, rh))
     }
 }
 impl TryFrom<Range> for FinRangeIter {
@@ -289,16 +308,16 @@ impl TryFrom<Range> for FinRangeIter {
 }
 impl Range {
     fn new(cell1: SLoc, cell2: SLoc) -> Self {
-        Self(cell1, SLocBound(Bound::Fin(cell2.0), Bound::Fin(cell2.1)))
+        Self(cell1, SLocBound(Bound::Fin(cell2.1), Bound::Fin(cell2.2)))
     }
     fn new_inf(cell: SLoc) -> Self {
         Self(cell, SLocBound(Bound::Inf, Bound::Inf))
     }
     fn in_range(&self, cell: &SLoc) -> bool {
-        if cell.0 < self.0 .0 || cell.1 < self.0 .1 {
+        if self.0 .0 != cell.0 || cell.1 < self.0 .1 || cell.2 < self.0 .2 {
             false
         } else {
-            self.1 .0.ge(cell.0) && self.1 .1.ge(cell.1)
+            self.1 .0.ge(cell.1) && self.1 .1.ge(cell.2)
         }
     }
     fn into_inf(self) -> Self {
@@ -308,7 +327,7 @@ impl Range {
         matches!(self.1, SLocBound(Bound::Inf, _) | SLocBound(_, Bound::Inf))
     }
     fn width(&self) -> Bound {
-        let lb = self.0 .0;
+        let lb = self.0 .1;
         let Bound::Fin(ub) = self.1 .0 else {
             return Bound::Inf;
         };
@@ -322,16 +341,25 @@ impl Range {
         Bound::Fin(ub - lb + 1)
     }
     fn intersect(&self, other: &Range) -> Range {
-        Range(
-            (self.0 .0.max(other.0 .0), self.0 .1.max(other.0 .1)),
-            SLocBound(self.1 .0.min(other.1 .0), self.1 .1.min(other.1 .1)),
-        )
+        if self.0 .0 != other.0 .0 {
+            Range(self.0, SLocBound(Bound::Fin(-1), Bound::Fin(-1)))
+        } else {
+            Range(
+                SLoc(
+                    self.0 .0,
+                    self.0 .1.max(other.0 .1),
+                    self.0 .2.max(other.0 .2),
+                ),
+                SLocBound(self.1 .0.min(other.1 .0), self.1 .1.min(other.1 .1)),
+            )
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ConstType {
     Num(f64),
     String(String),
+    Table(&'static str),
     Bool(bool),
     Error(CellError),
     Range(Range),
@@ -412,6 +440,7 @@ impl From<&ConstType> for String {
             ConstType::Range(_) => "Range is not valid here".to_string(),
             ConstType::Color((r, g, b)) => format!("Color #{r},{g},{b}"),
             ConstType::Function(_) => format!("Function"),
+            ConstType::Table(t) => format!("'{t}'"),
         }
     }
 }
@@ -477,6 +506,11 @@ impl FromStr for ConstType {
             && s.chars().last().is_some_and(|c| c == '"')
         {
             Ok(Self::String(s[1..s.len() - 1].to_owned()))
+        } else if s.len() > 1
+            && s.chars().next().is_some_and(|c| c == '\'')
+            && s.chars().last().is_some_and(|c| c == '\'')
+        {
+            Ok(Self::Table(s[1..s.len() - 1].to_owned().leak()))
         } else {
             Err(Self::Error(CellError::InvalidFormula {
                 cell: None,
@@ -555,6 +589,19 @@ impl ConstType {
                     cursor,
                     reason,
                 },
+                CellError::InvalidInfinity { cell: None, cursor } => CellError::InvalidInfinity {
+                    cell: Some(pos),
+                    cursor,
+                },
+                CellError::WrongNumArguments {
+                    cell: None,
+                    cursor,
+                    arguments,
+                } => CellError::WrongNumArguments {
+                    cell: Some(pos),
+                    cursor,
+                    arguments,
+                },
                 _ => e,
             }),
             _ => self,
@@ -569,6 +616,7 @@ impl ConstType {
             ConstType::Range(_) => false,
             ConstType::Color(_) => false,
             ConstType::Function(_) => false,
+            ConstType::Table(_) => true,
         }
     }
     // fn to_pos(&self, pos: SLoc) -> Self {
@@ -636,7 +684,7 @@ trait IsIdentifier {
 }
 impl IsIdentifier for char {
     fn is_iden(&self) -> bool {
-        self.is_alphanumeric() || self == &'.' || self == &':'
+        self.is_alphanumeric() || self == &'.' || self == &':' || self == &'\''
     }
 }
 
@@ -647,17 +695,28 @@ fn form_tokens(formula: &str) -> Vec<(&str, usize)> {
 
     let mut string_mode: Option<String> = None;
     let mut escape_mode = false;
+    let mut filename_mode = false;
     for (i, c) in formula.chars().enumerate() {
-        if alpha && !c.is_iden() {
-            alpha = false;
-            v.push((&formula[start..i], start));
-            start = i;
+        if alpha {
+            // println!("c:{c} mode: {filename_mode}");
+            if filename_mode {
+                if c == '\'' {
+                    filename_mode = false;
+                }
+            } else if c == '\'' {
+                filename_mode = true;
+            } else if !c.is_iden() {
+                // println!("token from form_tokens {}", &formula[start..i]);
+                alpha = false;
+                v.push((&formula[start..i], start));
+                start = i;
+            }
         }
         if !alpha {
             if c == '"' || string_mode.is_some() {
                 // println!("c:{c} esc:{escape_mode}");
                 if let Some(mut string_val) = string_mode {
-                    if c == '"' && !escape_mode {
+                    if c == '"' && string_val.chars().next().unwrap() == '"' && !escape_mode {
                         string_mode = None;
                         string_val.push('"');
                         v.push((string_val.leak(), start));
@@ -693,6 +752,10 @@ fn form_tokens(formula: &str) -> Vec<(&str, usize)> {
                     };
                     alpha = true;
                     start = i;
+                    if c == '\'' {
+                        // start = i + 1;
+                        filename_mode = true;
+                    }
                     continue;
                 }
                 if !c.is_whitespace() {
@@ -949,7 +1012,7 @@ fn split_parens<'a>(tokens: &[(&'a str, usize)]) -> Result<ParenTree<'a>, Value>
 
 // TODO functions with no arguments
 // TODO parse ranges of cells
-fn form_tree(split_par: &ParenTree<'_>) -> (Value, bool) {
+fn form_tree(split_par: &ParenTree<'_>, in_sheet: &'static str) -> (Value, bool) {
     if split_par.len() == 0 {
         return (
             Value::Const(
@@ -965,13 +1028,13 @@ fn form_tree(split_par: &ParenTree<'_>) -> (Value, bool) {
     }
     // dbg!(&split_par);
     if let ParenTree::Token(sp, i) = split_par {
-        return if let Some(r) = is_ref(sp) {
+        return if let Some(r) = is_ref(sp, in_sheet) {
             (Value::Ref(r), false)
         } else if let Some(c) = is_const(sp) {
             (Value::Const(c), false)
         } else if let Some(s) = is_spec(sp) {
             (Value::Special(s), false)
-        } else if let Some(r) = is_range(sp) {
+        } else if let Some(r) = is_range(sp, in_sheet) {
             (Value::Const(ConstType::Range(r).into()), false)
         } else {
             // dbg!(sp);
@@ -1029,12 +1092,12 @@ fn form_tree(split_par: &ParenTree<'_>) -> (Value, bool) {
                     CatParsed::Args(
                         vargs
                             .split(|varg| varg.is_comma())
-                            .map(|varg| (form_tree(&ParenTree::Paren((varg).to_vec()))).0)
+                            .map(|varg| (form_tree(&ParenTree::Paren((varg).to_vec()), in_sheet)).0)
                             .collect(),
                     )
                 } else {
                     // println!("As val");
-                    CatParsed::Value(form_tree(v))
+                    CatParsed::Value(form_tree(v, in_sheet))
                 }
             }
             Category::Operand => CatParsed::Operand(v.as_op().unwrap()),
@@ -1376,36 +1439,73 @@ fn letters_to_row(token: &str) -> Option<i32> {
     Some((s - 1) as i32)
 }
 
-fn is_ref(token: &str) -> Option<SLoc> {
-    if !token.chars().next().is_some_and(|c| c.is_alphabetic()) {
-        None
-    } else {
-        let mut f = false;
-        let mut col = 0;
-        let mut row = 0;
-        for c in token.chars() {
-            if f && c.is_alphabetic() {
-                return None;
+fn is_ref(token: &str, in_sheet: &'static str) -> Option<SLoc> {
+    match token.chars().next() {
+        Some(c) if c.is_alphabetic() => {
+            let mut f = false;
+            let mut col = 0;
+            let mut row = 0;
+            for c in token.chars() {
+                if f && c.is_alphabetic() {
+                    return None;
+                }
+                if !c.is_alphabetic() {
+                    f = true;
+                }
+                if !f {
+                    col = col * 26 + (c.to_digit(36)? - 9);
+                } else {
+                    row = row * 10 + c.to_digit(10)?;
+                }
             }
-            if !c.is_alphabetic() {
-                f = true;
-            }
-            if !f {
-                col = col * 26 + (c.to_digit(36)? - 9);
+            if col < 1 || row < 1 {
+                None
             } else {
-                row = row * 10 + c.to_digit(10)?;
+                Some(SLoc(in_sheet, (col - 1) as i32, (row - 1) as i32))
             }
         }
-        if col < 1 || row < 1 {
-            None
-        } else {
-            Some(((col - 1) as i32, (row - 1) as i32))
+        Some('\'') => {
+            // println!("{token}");
+            let mut f = false;
+            let mut col = 0;
+            let mut row = 0;
+
+            let Some((endt, _)) = token.chars().enumerate().filter(|(_, c)| c == &'\'').nth(1)
+            else {
+                return None;
+            };
+            let sheet = token[1..endt].to_string().leak();
+            // println!("Sheet {sheet}");
+
+            for c in token.chars().skip(endt + 1) {
+                // println!("taking {c}");
+                if f && c.is_alphabetic() {
+                    return None;
+                }
+                if !c.is_alphabetic() {
+                    f = true;
+                }
+                if !f {
+                    col = col * 26 + (c.to_digit(36)? - 9);
+                } else {
+                    row = row * 10 + c.to_digit(10)?;
+                }
+            }
+            if col < 1 || row < 1 {
+                None
+            } else {
+                Some(SLoc(sheet, (col - 1) as i32, (row - 1) as i32))
+            }
         }
+        _ => None,
     }
 }
 
-pub(crate) fn show_ref(loc: &SLoc) -> String {
-    format!("{}{}", show_col(loc.0), loc.1 + 1)
+pub(crate) fn show_ref_local(loc: &SLoc) -> String {
+    format!("{}{}", show_col(loc.1), loc.2 + 1)
+}
+pub(crate) fn show_ref_global(loc: &SLoc) -> String {
+    format!("'{}'{}{}", loc.0, show_col(loc.1), loc.2 + 1)
 }
 
 pub(crate) fn show_col(x: i32) -> String {
@@ -1421,15 +1521,15 @@ pub(crate) fn show_col(x: i32) -> String {
 fn is_const(token: &str) -> Option<Const> {
     ConstType::from_str(token).ok().map(ConstType::into)
 }
-fn is_range(token: &str) -> Option<Range> {
+fn is_range(token: &str, in_sheet: &'static str) -> Option<Range> {
     let mut split = token.split(':');
-    let start = is_ref(split.next()?)?;
+    let start = is_ref(split.next()?, in_sheet)?;
     if let Some(nx) = split.next() {
         if nx.is_empty() {
             Some(Range::new_inf(start))
         } else if let Ok(n) = nx.parse::<i32>() {
             // println!("{n} {start:?}");
-            if n - 1 < start.1 {
+            if n - 1 < start.2 {
                 None
             } else {
                 Some(Range(start, SLocBound(Bound::Inf, Bound::Fin(n - 1))))
@@ -1437,14 +1537,14 @@ fn is_range(token: &str) -> Option<Range> {
         } else if nx.chars().all(char::is_alphabetic) {
             let c = letters_to_row(nx)?;
             // println!("{c} {start:?}");
-            if c < start.0 {
+            if c < start.1 {
                 None
             } else {
                 Some(Range(start, SLocBound(Bound::Fin(c), Bound::Inf)))
             }
         } else {
-            let end = is_ref(nx)?;
-            if split.next().is_some() || end.0 < start.0 || end.1 < start.1 {
+            let end = is_ref(nx, in_sheet)?;
+            if split.next().is_some() || end.1 < start.1 || end.2 < start.2 {
                 None
             } else {
                 Some(Range::new(start, end))
@@ -1460,11 +1560,14 @@ fn is_spec(token: &str) -> Option<Spec> {
         // ".." => Some(Spec::dd),
         ".R" => Some(Spec::dR),
         ".C" => Some(Spec::dC),
+        ".T" => Some(Spec::dT),
         ".SR" => Some(Spec::dSR),
         ".SC" => Some(Spec::dSC),
+        ".ST" => Some(Spec::dST),
         // ".S." => Some(Spec::dSd),
         ".FR" => Some(Spec::dFR),
         ".FC" => Some(Spec::dFC),
+        ".FT" => Some(Spec::dFT),
         ".I" => Some(Spec::dI),
         ".F." => Some(Spec::dFd),
         _ if &token[..2] == ".H" => {
@@ -1494,10 +1597,8 @@ fn is_spec(token: &str) -> Option<Spec> {
     }
 }
 
-impl FromStr for Value {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+impl Value {
+    pub(crate) fn from_str(s: &str, in_sheet: &'static str) -> Result<Self, &'static str> {
         if !matches!(s.chars().next(), Some('=') | Some('[')) {
             Ok(Value::Const(ConstType::parse_exact(s).into()))
         } else if let Some(form) = s.strip_prefix('=') {
@@ -1508,9 +1609,9 @@ impl FromStr for Value {
                 let _ = dbg!(split_parens(&tokens));
                 return Err("Couldnt parenthesize");
             };
-            Ok(form_tree(&split).0)
+            Ok(form_tree(&split, in_sheet).0)
         } else {
-            Ok(Value::RangeForm(Rc::new(is_range_formula(s)?)))
+            Ok(Value::RangeForm(Rc::new(is_range_formula(s, in_sheet)?)))
         }
     }
 }
@@ -1543,7 +1644,7 @@ impl Value {
         spec: &'a SpecValues,
     ) -> Cow<'a, Const> {
         // ConstType::String("".into().into())
-        let l = (spec.dC, spec.dR);
+        let l = spec.to_sloc();
         if self.is_function() {
             return Cow::Owned(ConstType::Function(Box::new(self.clone())).into());
         }
@@ -1565,18 +1666,18 @@ impl Value {
             *x = spec.depth;
         }
         let t = match self {
-            Value::Const(Const {
-                ct: ConstType::Range(_),
-                bgcolor: _,
-                textcolor: _,
-            }) => Cow::Owned(
-                ConstType::Error(CellError::InvalidFormula {
-                    cell: Some(spec.to_sloc()),
-                    cursor: 0,
-                    reason: "Range cannot be assigned to a cell",
-                })
-                .into(),
-            ),
+            // Value::Const(Const {
+            //     ct: ConstType::Range(_),
+            //     bgcolor: _,
+            //     textcolor: _,
+            // }) => Cow::Owned(
+            //     ConstType::Error(CellError::InvalidFormula {
+            //         cell: Some(spec.to_sloc()),
+            //         cursor: 0,
+            //         reason: "Range cannot be assigned to a cell",
+            //     })
+            //     .into(),
+            // ),
             Value::Const(c) => Cow::Borrowed(c),
             Value::Ref(r) => Cow::Owned({
                 if matches!(get_range_form(ranges, r), Ok(Some(rf)) if rf !=r) {
@@ -1593,8 +1694,7 @@ impl Value {
                                 })
                                 .into()
                             } else {
-                                d.val
-                                    .parse::<Value>()
+                                Value::from_str(&d.val, rf.0)
                                     .unwrap()
                                     .eval(data, eval, func, ranges, &new_spec)
                                     .into_owned()
@@ -1615,8 +1715,7 @@ impl Value {
                                 })
                                 .into()
                             } else {
-                                d.val
-                                    .parse::<Value>()
+                                Value::from_str(&d.val, r.0)
                                     .unwrap()
                                     .eval(data, eval, func, ranges, &new_spec)
                                     .into_owned()
@@ -1668,48 +1767,94 @@ impl Value {
                     )
                 }
             }
-            Value::Special(s) => {
-                match s {
-                    Spec::dC => Cow::Owned(ConstType::Num(spec.dC as f64).into()),
-                    Spec::dR => Cow::Owned(ConstType::Num(spec.dR as f64).into()),
-                    Spec::dSC => Cow::Owned(if let Some(v) = spec.dSC {
-                        ConstType::Num(v as f64).into()
+            Value::Special(s) => match s {
+                Spec::dC => Cow::Owned(ConstType::Num(spec.dC as f64).into()),
+                Spec::dR => Cow::Owned(ConstType::Num(spec.dR as f64).into()),
+                Spec::dSC => Cow::Owned(if let Some(v) = spec.dSC {
+                    ConstType::Num(v as f64).into()
+                } else {
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                        reason: "S is only valid in range formulas",
+                    })
+                    .into()
+                }),
+                Spec::dSR => Cow::Owned(if let Some(v) = spec.dSR {
+                    ConstType::Num(v as f64).into()
+                } else {
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                        reason: "S is only valid in range formulas",
+                    })
+                    .into()
+                }),
+                Spec::dFd => {
+                    if let Some(ref v) = spec.dFd {
+                        Cow::Borrowed(v)
                     } else {
-                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
-                    }),
-                    Spec::dSR => Cow::Owned(if let Some(v) = spec.dSR {
-                        ConstType::Num(v as f64).into()
-                    } else {
-                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
-                    }),
-                    Spec::dFd => {
-                        if let Some(ref v) = spec.dFd {
-                            Cow::Borrowed(v)
-                        } else {
-                            Cow::Owned(ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into())
-                        }
+                        Cow::Owned(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: Some(spec.to_sloc()),
+                                cursor: 0,
+                                reason: "F is only valid in range functions",
+                            })
+                            .into(),
+                        )
                     }
-                    Spec::dFC => Cow::Owned(if let Some(v) = spec.dFC {
-                        ConstType::Num(v as f64).into()
-                    } else {
-                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
-                    }),
-                    Spec::dFR => Cow::Owned(if let Some(v) = spec.dFR {
-                        ConstType::Num(v as f64).into()
-                    } else {
-                        ConstType::Error(CellError::InvalidFormula { cell: Some(spec.to_sloc()), cursor: 0, reason: "S and F are only valid in range formulas and functions respecively." }).into()
-                    }),
-                    Spec::dI => Cow::Owned(
-                        ConstType::Error(CellError::InvalidInfinity {
-                            cell: Some(spec.to_sloc()),
-                            cursor: 0,
-                        })
-                        .into(),
-                    ),
-                    Spec::dH(r, g, b) => Cow::Owned(ConstType::Color((*r, *g, *b)).into()),
-                    Spec::dA(_) => Cow::Owned(ConstType::Function(Box::new(self.clone())).into()),
                 }
-            }
+                Spec::dFC => Cow::Owned(if let Some(v) = spec.dFC {
+                    ConstType::Num(v as f64).into()
+                } else {
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                        reason: "F is only valid in range functions",
+                    })
+                    .into()
+                }),
+                Spec::dFR => Cow::Owned(if let Some(v) = spec.dFR {
+                    ConstType::Num(v as f64).into()
+                } else {
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                        reason: "F is only valid in range functions",
+                    })
+                    .into()
+                }),
+                Spec::dI => Cow::Owned(
+                    ConstType::Error(CellError::InvalidInfinity {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                    })
+                    .into(),
+                ),
+                Spec::dH(r, g, b) => Cow::Owned(ConstType::Color((*r, *g, *b)).into()),
+                Spec::dA(_) => Cow::Owned(ConstType::Function(Box::new(self.clone())).into()),
+                Spec::dT => Cow::Owned(ConstType::Table(spec.dT).into()),
+                Spec::dST => Cow::Owned(if let Some(v) = spec.dST {
+                    ConstType::Table(v).into()
+                } else {
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                        reason: "S is only valid in range formulas",
+                    })
+                    .into()
+                }),
+                Spec::dFT => Cow::Owned(if let Some(v) = spec.dFT {
+                    ConstType::Table(v).into()
+                } else {
+                    ConstType::Error(CellError::InvalidFormula {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                        reason: "F is only valid in range functions",
+                    })
+                    .into()
+                }),
+            },
             Value::Mul(lhs, rhs) => {
                 let lhs_eval = lhs.eval(data, eval, func, ranges, spec);
                 let rhs_eval = rhs.eval(data, eval, func, ranges, spec);
@@ -1834,7 +1979,7 @@ impl Value {
         t
     }
 
-    fn get_refs(
+    pub(crate) fn get_refs(
         &self,
         data: &SheetData,
         eval: &mut SheetEval,
@@ -1889,7 +2034,7 @@ impl Value {
                 Bound::Fin(r) => Bound::Fin(r + spec.dR),
                 Bound::Inf => Bound::Inf,
             };
-            Some(Range((spec.dC, spec.dR), SLocBound(c2, r2)))
+            Some(Range(spec.to_sloc(), SLocBound(c2, r2)))
         } else {
             None
         }
@@ -1932,7 +2077,7 @@ pub(crate) struct RangeFormula {
     value: Value,
 }
 
-fn is_range_formula(formula: &str) -> Result<RangeFormula, &'static str> {
+fn is_range_formula(formula: &str, in_sheet: &'static str) -> Result<RangeFormula, &'static str> {
     let Some((range, form)) = formula.split_once('=') else {
         return Err("No equal sign found");
     };
@@ -1983,14 +2128,14 @@ fn is_range_formula(formula: &str) -> Result<RangeFormula, &'static str> {
     };
     // dbg!(&cond);
 
-    let cond_val = form_tree(&cond).0;
+    let cond_val = form_tree(&cond, in_sheet).0;
 
     let tokens_form = form_tokens(form);
     let Ok(split_form) = split_parens(&tokens_form) else {
         let _ = dbg!(split_parens(&tokens_form));
         return Err("Couldnt parenthesize");
     };
-    let form_val = form_tree(&split_form).0;
+    let form_val = form_tree(&split_form, in_sheet).0;
 
     Ok(RangeFormula {
         rbound,
@@ -2226,7 +2371,7 @@ impl Sheet {
             if let Ok(s) = s {
                 for p in s.dependants.clone().iter() {
                     if let Ok(dep_val) = self.get_val(p) {
-                        if let Ok(pv) = dep_val.parse::<Value>() {
+                        if let Ok(pv) = Value::from_str(dep_val, p.0) {
                             if !pv
                                 .get_refs(
                                     &self.data,
@@ -2264,7 +2409,7 @@ impl Sheet {
             let mut toadd = None;
             let mut rfm = None;
             if let Ok(s) = sval {
-                if let Ok(pv) = s.parse::<Value>() {
+                if let Ok(pv) = Value::from_str(s, pos.0) {
                     toadd = Some(pv.get_refs(
                         &self.data,
                         &mut self.eval,
@@ -2353,17 +2498,20 @@ impl Sheet {
                                     continue;
                                 };
                                 let spec = SpecValues {
-                                    dC: pos.0,
-                                    dR: pos.1,
-                                    dSC: Some(oloc.0),
-                                    dSR: Some(oloc.1),
+                                    dC: pos.1,
+                                    dR: pos.2,
+                                    dT: pos.0,
+                                    dSC: Some(oloc.1),
+                                    dSR: Some(oloc.2),
+                                    dST: Some(oloc.0),
                                     dFd: None,
                                     dFC: None,
                                     dFR: None,
                                     depth: 0,
+                                    dFT: None,
                                 };
                                 (
-                                    match self.get(oloc).unwrap().val.parse::<Value>() {
+                                    match Value::from_str(&self.get(oloc).unwrap().val, pos.0) {
                                         Ok(val) => val,
                                         Err(e) => Value::Const(
                                             ConstType::Error(CellError::InvalidFormula {
@@ -2385,17 +2533,20 @@ impl Sheet {
                     } else {
                         let val = s.val.clone();
                         let spec = SpecValues {
-                            dC: pos.0,
-                            dR: pos.1,
+                            dT: pos.0,
+                            dC: pos.1,
+                            dR: pos.2,
+                            dST: None,
                             dSC: None,
                             dSR: None,
+                            dFT: None,
                             dFd: None,
                             dFC: None,
                             dFR: None,
                             depth: 0,
                         };
                         (
-                            match val.parse::<Value>() {
+                            match Value::from_str(&val, pos.0) {
                                 Ok(val) => val,
                                 Err(e) => Value::Const(
                                     ConstType::Error(CellError::InvalidFormula {
@@ -2558,13 +2709,26 @@ impl Function for Valid {
         ranges: &SheetRanges,
         spec: &SpecValues,
     ) -> Const {
-        let [c, r] = args else {
+        let [f, c, r] = args else {
             return ConstType::Error(CellError::WrongNumArguments {
-                cell: Some((spec.dC, spec.dR)),
+                cell: Some(spec.to_sloc()),
                 cursor: 0,
-                arguments: vec![2],
+                arguments: vec![3],
             })
             .into();
+        };
+        let f = f.eval(data, eval, func, ranges, spec);
+        let ConstType::Table(f) = f.as_ref().ct else {
+            if let ConstType::Error(_) = f.as_ref().ct {
+                return f.into_owned();
+            } else {
+                return ConstType::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    expected_types: vec!["File name".into()],
+                })
+                .into();
+            }
         };
         let c = c.eval(data, eval, func, ranges, spec);
         let ConstType::Num(c) = c.as_ref().ct else {
@@ -2572,7 +2736,7 @@ impl Function for Valid {
                 return c.into_owned();
             } else {
                 return ConstType::Error(CellError::BadArgument {
-                    cell: Some((spec.dC, spec.dR)),
+                    cell: Some(spec.to_sloc()),
                     cursor: 0,
                     expected_types: vec!["Number".into()],
                 })
@@ -2585,7 +2749,7 @@ impl Function for Valid {
                 return r.into_owned();
             } else {
                 return ConstType::Error(CellError::BadArgument {
-                    cell: Some((spec.dC, spec.dR)),
+                    cell: Some(spec.to_sloc()),
                     cursor: 1,
                     expected_types: vec!["Number".into()],
                 })
@@ -2595,7 +2759,7 @@ impl Function for Valid {
         // TODO make this more rigid, find good way to do a let else
         if c < 0. || c != c.round() || r < 0. || r.round() != r {
             return ConstType::Error(CellError::BadArgument {
-                cell: Some((spec.dC, spec.dR)),
+                cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["whole number".into()],
             })
@@ -2604,7 +2768,7 @@ impl Function for Valid {
         let c = c as i32;
         let r = r as i32;
 
-        let rf = data.get(&(c, r), eval);
+        let rf = data.get(&SLoc(f, c, r), eval);
         if rf.is_err() {
             return ConstType::Bool(false).into();
         }
@@ -2612,18 +2776,18 @@ impl Function for Valid {
         if let Some(d) = rf.display.clone() {
             ConstType::Bool(d.ct.truthy()).into()
         } else {
-            let val = match rf.val.parse::<Value>() {
+            let val = match Value::from_str(&rf.val, f) {
                 Ok(v) => v,
                 Err(e) => {
                     return ConstType::Error(CellError::InvalidFormula {
-                        cell: Some((c, r)),
+                        cell: Some(SLoc(f, c, r)),
                         cursor: 0,
                         reason: e,
                     })
                     .into()
                 }
             };
-            let new_spec = spec.clone().with_sloc((c, r));
+            let new_spec = spec.clone().with_sloc(SLoc(f, c, r));
 
             val.eval(data, eval, func, ranges, &new_spec).into_owned()
         }
@@ -2641,7 +2805,11 @@ impl Function for Valid {
             .iter()
             .flat_map(|a| a.get_refs(data, eval, func, ranges, spec))
             .collect();
-        let [c, r] = args else {
+        let [f, c, r] = args else {
+            return refs;
+        };
+        let f = f.eval(data, eval, func, ranges, spec);
+        let ConstType::Table(f) = f.as_ref().ct else {
             return refs;
         };
         let c = c.eval(data, eval, func, ranges, spec);
@@ -2658,7 +2826,7 @@ impl Function for Valid {
         }
         let c = c as i32;
         let r = r as i32;
-        refs.push((&(c, r)).into());
+        refs.push((&SLoc(f, c, r)).into());
         refs
     }
 }
@@ -2790,7 +2958,7 @@ fn sum_range(
             },
         };
         // dbg!(v);
-        let Ok(v) = v.val.parse::<Value>() else {
+        let Ok(v) = Value::from_str(&v.val, elem.0) else {
             return Some(ConstType::Error(CellError::MissingCell { cell: Some(*elem) }).into());
         };
         let new_spec = spec.clone().with_sloc(*elem);
@@ -2822,13 +2990,26 @@ impl Function for ValueFunc {
         ranges: &SheetRanges,
         spec: &SpecValues,
     ) -> Const {
-        let [c, r] = args else {
+        let [f, c, r] = args else {
             return ConstType::Error(CellError::WrongNumArguments {
-                cell: Some((spec.dC, spec.dR)),
+                cell: Some(spec.to_sloc()),
                 cursor: 0,
-                arguments: vec![2],
+                arguments: vec![3],
             })
             .into();
+        };
+        let f = f.eval(data, eval, func, ranges, spec);
+        let ConstType::Table(f) = f.as_ref().ct else {
+            if let ConstType::Error(_) = f.as_ref().ct {
+                return f.into_owned();
+            } else {
+                return ConstType::Error(CellError::BadArgument {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    expected_types: vec!["File name".into()],
+                })
+                .into();
+            }
         };
         let c = c.eval(data, eval, func, ranges, spec);
         let ConstType::Num(c) = c.as_ref().ct else {
@@ -2836,8 +3017,8 @@ impl Function for ValueFunc {
                 return c.into_owned();
             } else {
                 return ConstType::Error(CellError::BadArgument {
-                    cell: Some((spec.dC, spec.dR)),
-                    cursor: 0,
+                    cell: Some(spec.to_sloc()),
+                    cursor: 1,
                     expected_types: vec!["Number".into()],
                 })
                 .into();
@@ -2849,8 +3030,8 @@ impl Function for ValueFunc {
                 return r.into_owned();
             } else {
                 return ConstType::Error(CellError::BadArgument {
-                    cell: Some((spec.dC, spec.dR)),
-                    cursor: 1,
+                    cell: Some(spec.to_sloc()),
+                    cursor: 2,
                     expected_types: vec!["Number".into()],
                 })
                 .into();
@@ -2859,7 +3040,7 @@ impl Function for ValueFunc {
         // TODO make this more rigid, find good way to do a let else
         if c < 0. || c != c.round() || r < 0. || r.round() != r {
             return ConstType::Error(CellError::BadArgument {
-                cell: Some((spec.dC, spec.dR)),
+                cell: Some(spec.to_sloc()),
                 cursor: 0,
                 expected_types: vec!["whole number".into()],
             })
@@ -2868,7 +3049,7 @@ impl Function for ValueFunc {
         let c = c as i32;
         let r = r as i32;
 
-        let rf = data.get(&(c, r), eval);
+        let rf = data.get(&SLoc(f, c, r), eval);
         if let Err(e) = rf {
             return ConstType::Error(e).into();
         }
@@ -2876,18 +3057,18 @@ impl Function for ValueFunc {
         if let Some(d) = rf.display.clone() {
             d
         } else {
-            let val = match rf.val.parse::<Value>() {
+            let val = match Value::from_str(&rf.val, f) {
                 Ok(v) => v,
                 Err(e) => {
                     return ConstType::Error(CellError::InvalidFormula {
-                        cell: Some((c, r)),
+                        cell: Some(SLoc(f, c, r)),
                         cursor: 0,
                         reason: e,
                     })
                     .into()
                 }
             };
-            let new_spec = spec.clone().with_sloc((c, r));
+            let new_spec = spec.clone().with_sloc(SLoc(f, c, r));
 
             val.eval(data, eval, func, ranges, &new_spec).into_owned()
         }
@@ -2905,7 +3086,11 @@ impl Function for ValueFunc {
             .iter()
             .flat_map(|a| a.get_refs(data, eval, func, ranges, spec))
             .collect();
-        let [c, r] = args else {
+        let [f, c, r] = args else {
+            return refs;
+        };
+        let f = f.eval(data, eval, func, ranges, spec);
+        let ConstType::Table(f) = f.as_ref().ct else {
             return refs;
         };
         let c = c.eval(data, eval, func, ranges, spec);
@@ -2922,7 +3107,7 @@ impl Function for ValueFunc {
         }
         let c = c as i32;
         let r = r as i32;
-        refs.push((&(c, r)).into());
+        refs.push((&SLoc(f, c, r)).into());
         refs
     }
 }
@@ -2970,7 +3155,7 @@ impl Function for CountIf {
                 continue;
             };
             let inner_spec = spec.clone().with_sloc(*cell);
-            let val = celldata.val.parse::<Value>();
+            let val = Value::from_str(&celldata.val, cell.0);
             if let Err(val) = val {
                 return ConstType::Error(CellError::InvalidFormula {
                     cell: Some(inner_spec.to_sloc()),
@@ -3061,7 +3246,7 @@ impl Function for RangeFunc {
             }
             let c = c as i32;
             let r = r as i32;
-            refs.push(Range::from(&(c, r)).into_inf());
+            refs.push(Range::from(&SLoc(spec.dT, c, r)).into_inf());
             refs
         } else if let [c1, r1, c2, r2] = args {
             let c1 = c1.eval(data, eval, func, ranges, spec);
@@ -3086,7 +3271,7 @@ impl Function for RangeFunc {
             let Ok(r2) = TryInto::<Bound>::try_into(&r2.as_ref().ct) else {
                 return refs;
             };
-            refs.push(Range((c1, r1), SLocBound(c2, r2)));
+            refs.push(Range(SLoc(spec.dT, c1, r1), SLocBound(c2, r2)));
             refs
         } else {
             refs
@@ -3136,7 +3321,7 @@ impl Function for RangeFunc {
             }
             let c = c as i32;
             let r = r as i32;
-            ConstType::Range(Range::new_inf((c, r))).into()
+            ConstType::Range(Range::new_inf(SLoc(spec.dT, c, r))).into()
         } else if let [c1, r1, c2, r2] = args {
             let c1 = c1.eval(data, eval, func, ranges, spec);
             let ConstType::Num(c1) = c1.as_ref().ct else {
@@ -3177,7 +3362,7 @@ impl Function for RangeFunc {
                 Ok(b) => b,
                 Err(e) => return e.into_pos(spec.to_sloc()).into(),
             };
-            ConstType::Range(Range((c1, r1), SLocBound(c2, r2))).into()
+            ConstType::Range(Range(SLoc(spec.dT, c1, r1), SLocBound(c2, r2))).into()
         } else {
             ConstType::Error(CellError::WrongNumArguments {
                 cell: Some(spec.to_sloc()),
@@ -3516,7 +3701,7 @@ impl Function for PowFunc {
         ranges: &SheetRanges,
         spec: &SpecValues,
     ) -> Const {
-        let [num, prec] = args else {
+        let [base, exp] = args else {
             return ConstType::Error(CellError::WrongNumArguments {
                 cell: Some(spec.to_sloc()),
                 cursor: 0,
@@ -3524,8 +3709,8 @@ impl Function for PowFunc {
             })
             .into();
         };
-        let bc = num.eval(data, eval, func, ranges, spec);
-        let ec = prec.eval(data, eval, func, ranges, spec);
+        let bc = base.eval(data, eval, func, ranges, spec);
+        let ec = exp.eval(data, eval, func, ranges, spec);
         let arge: Const = ConstType::Error(CellError::BadArgument {
             cell: Some(spec.to_sloc()),
             cursor: 0,
@@ -3545,10 +3730,64 @@ impl Function for PowFunc {
         ConstType::Num(base.powf(exp)).into()
     }
 }
+#[derive(Default)]
+pub(crate) struct LogFunc;
+impl Function for LogFunc {
+    fn name(&self) -> &'static str {
+        "log"
+    }
+
+    fn call(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        ranges: &SheetRanges,
+        spec: &SpecValues,
+    ) -> Const {
+        let [num, base] = {
+            if let [num] = args {
+                [
+                    num,
+                    &Value::Const(ConstType::Num(std::f64::consts::E).into()),
+                ]
+            } else if let [num, base] = args {
+                [num, base]
+            } else {
+                return ConstType::Error(CellError::WrongNumArguments {
+                    cell: Some(spec.to_sloc()),
+                    cursor: 0,
+                    arguments: vec![1, 2],
+                })
+                .into();
+            }
+        };
+        let bc = num.eval(data, eval, func, ranges, spec);
+        let ec = base.eval(data, eval, func, ranges, spec);
+        let arge: Const = ConstType::Error(CellError::BadArgument {
+            cell: Some(spec.to_sloc()),
+            cursor: 0,
+            expected_types: vec!["Number".into(), "Number".into()],
+        })
+        .into();
+        let base = match &bc.ct {
+            ConstType::Num(n) => n,
+            ConstType::Error(e) => return ConstType::Error(e.clone()).into(),
+            _ => return arge,
+        };
+        let exp = match &ec.ct {
+            ConstType::Num(n) => *n,
+            ConstType::Error(e) => return ConstType::Error(e.clone()).into(),
+            _ => return arge,
+        };
+        ConstType::Num(base.log(exp)).into()
+    }
+}
 
 impl Value {
     fn replace_args(&self, args: &[Self]) -> Self {
-        println!("Replacing {self:?}");
+        // println!("Replacing {self:?}");
         match self {
             Value::Const(c) => match &c.ct {
                 ConstType::Function(f) => {
@@ -3644,9 +3883,332 @@ impl Function for CallFunc {
             })
             .into();
         };
-        dbg!(f_val.replace_args(&args[1..]))
+        f_val
+            .replace_args(&args[1..])
             .eval(data, eval, func, ranges, spec)
             .to_pos(spec.to_sloc())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FilterFunc(Mutex<Vec<(SLoc, Vec<usize>)>>);
+impl Function for FilterFunc {
+    fn name(&self) -> &'static str {
+        "filter"
+    }
+
+    fn call(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        ranges: &SheetRanges,
+        spec: &SpecValues,
+    ) -> Const {
+        let error: Const = ConstType::Error(CellError::BadArgument {
+            cell: Some(spec.to_sloc()),
+            cursor: 0,
+            expected_types: vec!["Row".into(), "Filter".into()],
+        })
+        .into();
+        // println!("filter 1");
+        let Some(range) = args.get(0) else {
+            return error;
+        };
+        // println!("filter 2");
+        let ConstType::Range(range) = range.eval(data, eval, func, ranges, spec).ct.clone() else {
+            return error;
+        };
+        // println!("filter 3");
+        if range.width() != Bound::Fin(1) {
+            return error;
+        }
+
+        // println!("filter 4");
+        let Some(filter) = args.get(1) else {
+            return error;
+        };
+        match spec.dSR {
+            Some(src_row) => {
+                let offset = spec.dR - src_row;
+                // println!("Find offset {offset}");
+                let src_col = spec.dSC.unwrap();
+                let src_table = spec.dST.unwrap();
+                let mut cache = self.0.lock().unwrap();
+                if !cache
+                    .iter()
+                    .any(|(cell, _)| cell == &SLoc(src_table, src_col, src_row))
+                {
+                    cache.push((SLoc(src_table, src_col, src_row), vec![]));
+                }
+                let cache_row = &mut cache
+                    .iter_mut()
+                    .find(|(cell, _)| cell == &SLoc(src_table, src_col, src_row))
+                    .expect("Just made the row")
+                    .1;
+                let start_row = range.0 .2;
+                let col = range.0 .1;
+                let table = range.0 .0;
+                let mut offset_i = cache_row.len();
+                if offset < (offset_i as i32) {
+                    let row = start_row + (cache_row[offset as usize] as i32);
+                    if let Ok(f_cell) = data.get(&SLoc(table, col, row), eval) {
+                        if let Ok(f_val) = Value::from_str(&f_cell.val, table) {
+                            let f_const = f_val.eval(data, eval, func, ranges, spec).into_owned();
+
+                            let spec = spec
+                                .clone()
+                                .with_f_sloc(Some((SLoc(table, row, col), f_const.clone())));
+                            let filter_const = filter.eval(data, eval, func, ranges, &spec);
+                            if filter_const.ct.truthy() {
+                                return f_const;
+                            } else {
+                                cache_row.clear();
+                                offset_i = 0;
+                            }
+                        }
+                    }
+                }
+                let mut offset_n = if offset_i == 0 {
+                    0
+                } else {
+                    cache_row[offset_i - 1] + 1
+                };
+                drop(cache);
+
+                while (offset_i as i32) < offset {
+                    if offset_n > 10 {
+                        return ConstType::Bool(false).into();
+                    }
+                    // let col = start_col + (offset_n as i32);
+                    let row = start_row + (offset_n as i32);
+                    // println!("Checking row {row}");
+                    offset_n += 1;
+                    let Ok(f_cell) = data.get(&SLoc(table, col, row), eval) else {
+                        continue;
+                    };
+                    let Ok(f_val): Result<Value, _> = Value::from_str(&f_cell.val, table) else {
+                        continue;
+                    };
+                    let f_const = f_val.eval(data, eval, func, ranges, spec).into_owned();
+                    let spec = spec
+                        .clone()
+                        .with_f_sloc(Some((SLoc(table, row, col), f_const.clone())));
+                    let filter_const = filter.eval(data, eval, func, ranges, &spec);
+                    if filter_const.is_error() || filter_const.ct.truthy() {
+                        let mut cache = self.0.lock().unwrap();
+                        let cache_row = &mut cache
+                            .iter_mut()
+                            .find(|(cell, _)| cell == &SLoc(src_table, src_col, src_row))
+                            .expect("Just made the row")
+                            .1;
+                        cache_row.insert(offset_i as usize, offset_n - 1);
+                        offset_i += 1;
+                        if offset_i == offset as usize {
+                            return f_const;
+                        }
+                        // return filter_const.into_owned();
+                    }
+                }
+                ConstType::Bool(false).into()
+            }
+            None => {
+                let table = range.0 .0;
+                let col = range.0 .1;
+                let start_row = range.0 .2;
+                for row in start_row..10 {
+                    // println!("filter col {col}");
+                    let Ok(f_cell) = data.get(&SLoc(table, col, row), eval) else {
+                        continue;
+                    };
+                    // println!("Got cell {}", f_cell.val);
+                    let Ok(f_val): Result<Value, _> = Value::from_str(&f_cell.val, table) else {
+                        continue;
+                    };
+                    // println!("parse cell");
+                    let f_const = f_val
+                        .eval(
+                            data,
+                            eval,
+                            func,
+                            ranges,
+                            &spec.clone().with_sloc(SLoc(table, col, row)),
+                        )
+                        .into_owned();
+                    // println!("eval cell {:?}", f_const);
+                    let spec = spec
+                        .clone()
+                        .with_f_sloc(Some((SLoc(table, row, col), f_const.clone())));
+                    let filter_const = filter.eval(data, eval, func, ranges, &spec);
+                    // println!("eval filter {:?}", filter_const);
+                    if filter_const.is_error() {
+                        return filter_const.into_owned();
+                    }
+                    if filter_const.ct.truthy() {
+                        return f_const;
+                    }
+                }
+                ConstType::Bool(false).into()
+            }
+        }
+    }
+
+    fn get_refs(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        ranges: &SheetRanges,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
+        let arg_range = args.get(0).and_then(|c| {
+            if let ConstType::Range(r) = &c.eval(data, eval, func, ranges, spec).ct {
+                Some(r.clone())
+            } else {
+                None
+            }
+        });
+        args.iter()
+            .flat_map(|a| a.get_refs(data, eval, func, ranges, spec))
+            .chain(arg_range)
+            .collect()
+    }
+}
+#[derive(Default)]
+pub(crate) struct IntegrateFunc;
+impl Function for IntegrateFunc {
+    fn name(&self) -> &'static str {
+        "intr"
+    }
+
+    fn call(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        ranges: &SheetRanges,
+        spec: &SpecValues,
+    ) -> Const {
+        let [f, lb, ub] = args else {
+            return ConstType::Error(CellError::WrongNumArguments {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                arguments: vec![3],
+            })
+            .into();
+        };
+        let f_eval = f.eval(data, eval, func, ranges, spec);
+        if f_eval.is_error() {
+            return f_eval.into_owned();
+        }
+        let ConstType::Function(f_val) = &f_eval.ct else {
+            return ConstType::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 0,
+                expected_types: vec!["Function".into()],
+            })
+            .into();
+        };
+        let lb = lb.eval(data, eval, func, ranges, spec);
+        if lb.is_error() {
+            return f_eval.into_owned();
+        }
+        let ConstType::Num(lb) = &lb.ct else {
+            return ConstType::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 1,
+                expected_types: vec!["Number".into()],
+            })
+            .into();
+        };
+        let ub = ub.eval(data, eval, func, ranges, spec);
+        if ub.is_error() {
+            return f_eval.into_owned();
+        }
+        let ConstType::Num(ub) = &ub.ct else {
+            return ConstType::Error(CellError::BadArgument {
+                cell: Some(spec.to_sloc()),
+                cursor: 1,
+                expected_types: vec!["Number".into()],
+            })
+            .into();
+        };
+        let iters = 401;
+        let vals: Vec<Result<f64, Const>> = (0..iters)
+            .map(|i| lb + (i as f64) / (iters as f64 - 1.) * (ub - lb))
+            .map(|x| {
+                let val = f_val.replace_args(&[Value::Const(ConstType::Num(x).into())]);
+                let val = val.eval(data, eval, func, ranges, spec);
+                if val.is_error() {
+                    return Err(val.into_owned());
+                }
+                if let ConstType::Num(fout) = &val.ct {
+                    // println!("f({x})={fout}");
+                    Ok(*fout)
+                } else {
+                    Err(ConstType::Error(CellError::BadArgument {
+                        cell: Some(spec.to_sloc()),
+                        cursor: 0,
+                        expected_types: vec!["Function number -> number".into()],
+                    })
+                    .into())
+                }
+            })
+            .collect();
+        for v in vals.iter() {
+            if let Err(err) = v {
+                return err.clone();
+            }
+        }
+        let vals: Vec<f64> = vals.into_iter().map(Result::unwrap).collect();
+        ConstType::Num(
+            vals.into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let simp_w = if i == 0 || i == iters - 1 {
+                        v
+                    } else if i % 2 == 0 {
+                        2. * v
+                    } else {
+                        4. * v
+                    };
+                    simp_w * (ub - lb) / (iters as f64 - 1.) / 3.
+                })
+                .sum(),
+        )
+        .into()
+    }
+}
+pub(crate) enum NumConstType {
+    Pi,
+    E,
+}
+pub(crate) struct ConstFunc(pub(crate) NumConstType);
+impl Function for ConstFunc {
+    fn name(&self) -> &'static str {
+        match self.0 {
+            NumConstType::Pi => "pi",
+            NumConstType::E => "e",
+        }
+    }
+
+    fn call(
+        &self,
+        _args: &[Value],
+        _data: &SheetData,
+        _eval: &mut SheetEval,
+        _func: &SheetFunc,
+        _ranges: &SheetRanges,
+        _spec: &SpecValues,
+    ) -> Const {
+        ConstType::Num(match self.0 {
+            NumConstType::Pi => std::f64::consts::PI,
+            NumConstType::E => std::f64::consts::E,
+        })
+        .into()
     }
 }
 
@@ -3678,152 +4240,232 @@ mod test {
         assert_eq!(ConstType::Num(1.).merge_err(&ConstType::Num(2.)), None);
         assert_eq!(
             ConstType::Error(CellError::ReferenceLoop {
-                loop_point: Some((0, 0))
+                loop_point: Some(SLoc("", 0, 0))
             })
             .merge_err(&ConstType::Num(2.)),
             Some(CellError::ReferenceLoop {
-                loop_point: Some((0, 0))
+                loop_point: Some(SLoc("", 0, 0))
             })
         );
         assert_eq!(
             ConstType::Num(2.).merge_err(&ConstType::Error(CellError::ReferenceLoop {
-                loop_point: Some((0, 0))
+                loop_point: Some(SLoc("", 0, 0))
             })),
             Some(CellError::ReferenceLoop {
-                loop_point: Some((0, 0))
+                loop_point: Some(SLoc("", 0, 0))
             })
         );
         assert_eq!(
             ConstType::Error(CellError::ReferenceLoop {
-                loop_point: Some((0, 0))
+                loop_point: Some(SLoc("", 0, 0))
             })
             .merge_err(&ConstType::Error(CellError::ReferenceLoop {
-                loop_point: Some((1, 0))
+                loop_point: Some(SLoc("", 1, 0))
             })),
             Some(CellError::ReferenceLoop {
-                loop_point: Some((0, 0))
+                loop_point: Some(SLoc("", 0, 0))
             })
         );
     }
     #[test]
     fn range_parse() {
         assert_eq!(
-            is_range("A1:A1"),
-            Some(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Fin(0))))
-        );
-        assert_eq!(
-            is_range("A1:A5"),
-            Some(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Fin(4))))
-        );
-        assert_eq!(
-            is_range("A1:c5"),
-            Some(Range((0, 0), SLocBound(Bound::Fin(2), Bound::Fin(4))))
-        );
-        assert_eq!(
-            is_range("A1:AA123"),
-            Some(Range((0, 0), SLocBound(Bound::Fin(26), Bound::Fin(122))))
-        );
-        assert_eq!(
-            is_range("A1:ABCZ12345"),
+            is_range("A1:A1", ""),
             Some(Range(
-                (0, 0),
+                SLoc("", 0, 0),
+                SLocBound(Bound::Fin(0), Bound::Fin(0))
+            ))
+        );
+        assert_eq!(
+            is_range("A1:A5", ""),
+            Some(Range(
+                SLoc("", 0, 0),
+                SLocBound(Bound::Fin(0), Bound::Fin(4))
+            ))
+        );
+        assert_eq!(
+            is_range("A1:c5", ""),
+            Some(Range(
+                SLoc("", 0, 0),
+                SLocBound(Bound::Fin(2), Bound::Fin(4))
+            ))
+        );
+        assert_eq!(
+            is_range("A1:AA123", ""),
+            Some(Range(
+                SLoc("", 0, 0),
+                SLocBound(Bound::Fin(26), Bound::Fin(122))
+            ))
+        );
+        assert_eq!(
+            is_range("A1:ABCZ12345", ""),
+            Some(Range(
+                SLoc("", 0, 0),
                 SLocBound(Bound::Fin(19031), Bound::Fin(12344))
             ))
         );
         assert_eq!(
-            is_range("ACC1:ABCZ12345"),
+            is_range("ACC1:ABCZ12345", ""),
             Some(Range(
-                (756, 0),
+                SLoc("", 756, 0),
                 SLocBound(Bound::Fin(19031), Bound::Fin(12344))
             ))
         );
         assert_eq!(
-            is_range("A1:"),
-            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Inf)))
+            is_range("A1:", ""),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Inf, Bound::Inf)))
         );
         assert_eq!(
-            is_range("A1:A"),
-            Some(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
+            is_range("A1:A", ""),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
         );
         assert_eq!(
-            is_range("A1:C"),
-            Some(Range((0, 0), SLocBound(Bound::Fin(2), Bound::Inf)))
+            is_range("A1:C", ""),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Fin(2), Bound::Inf)))
         );
         assert_eq!(
-            is_range("A1:CC"),
-            Some(Range((0, 0), SLocBound(Bound::Fin(80), Bound::Inf)))
+            is_range("A1:CC", ""),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Fin(80), Bound::Inf)))
         );
         assert_eq!(
-            is_range("A1:1"),
-            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Fin(0))))
+            is_range("A1:1", ""),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Inf, Bound::Fin(0))))
         );
         assert_eq!(
-            is_range("A1:20"),
-            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Fin(19))))
+            is_range("A1:20", ""),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Inf, Bound::Fin(19))))
         );
-        assert_eq!(is_range("A0:A"), None,);
-        assert_eq!(is_range("A3:A1"), None,);
-        assert_eq!(is_range("B1:A1"), None,);
-        assert_eq!(is_range("B3:A"), None,);
-        assert_eq!(is_range("B3:1"), None,);
-        assert_eq!(is_range("ABCDE0:ABCZZ1"), None,);
-        assert_eq!(is_range("ABC3:ABK1"), None,);
-        assert_eq!(is_range("SUS1:AMO1"), None,);
-        assert_eq!(is_range("NGU3:S"), None,);
-        assert_eq!(is_range("ABCD420:69"), None);
+        assert_eq!(is_range("A0:A", ""), None,);
+        assert_eq!(is_range("A3:A1", ""), None,);
+        assert_eq!(is_range("B1:A1", ""), None,);
+        assert_eq!(is_range("B3:A", ""), None,);
+        assert_eq!(is_range("B3:1", ""), None,);
+        assert_eq!(is_range("ABCDE0:ABCZZ1", ""), None,);
+        assert_eq!(is_range("ABC3:ABK1", ""), None,);
+        assert_eq!(is_range("SUS1:AMO1", ""), None,);
+        assert_eq!(is_range("NGU3:S", ""), None,);
+        assert_eq!(is_range("ABCD420:69", ""), None);
 
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(2, 2)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(2, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(3, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(5, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(5, 5)));
-        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(0, 4)));
-        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(4, 0)));
-        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(8, 4)));
-        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5))).in_range(&(4, 8)));
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 2, 2))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 2, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 3, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 5, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 5, 5))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 0, 4))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 4, 0))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 8, 4))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Fin(5)))
+                .in_range(&SLoc("", 4, 8))
+        );
 
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(2, 2)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(2, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(3, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(5, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(5, 5)));
-        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(0, 4)));
-        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(4, 0)));
-        assert!(!Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(8, 4)));
-        assert!(Range((2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&(4, 8)));
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 2, 2))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 2, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 3, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 5, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 5, 5))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 0, 4))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 4, 0))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 8, 4))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Fin(5), Bound::Inf)).in_range(&SLoc("", 4, 8))
+        );
 
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(2, 2)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(2, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(3, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(5, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(5, 5)));
-        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(0, 4)));
-        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(4, 0)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(8, 4)));
-        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&(4, 8)));
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 2, 2))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 2, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 3, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 5, 3))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 5, 5))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 0, 4))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 4, 0))
+        );
+        assert!(
+            Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 8, 4))
+        );
+        assert!(
+            !Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Fin(5))).in_range(&SLoc("", 4, 8))
+        );
 
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(2, 2)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(2, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(3, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(5, 3)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(5, 5)));
-        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(0, 4)));
-        assert!(!Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(4, 0)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(8, 4)));
-        assert!(Range((2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&(4, 8)));
+        assert!(Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 2, 2)));
+        assert!(Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 2, 3)));
+        assert!(Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 3, 3)));
+        assert!(Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 5, 3)));
+        assert!(Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 5, 5)));
+        assert!(!Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 0, 4)));
+        assert!(!Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 4, 0)));
+        assert!(Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 8, 4)));
+        assert!(Range(SLoc("", 2, 2), SLocBound(Bound::Inf, Bound::Inf)).in_range(&SLoc("", 4, 8)));
     }
     #[test]
     fn ref_inv() {
         let tests = ["A1", "B3", "AA72", "AAA72", "AAZZ99999"];
-        let tests2 = [(0, 0), (1, 3), (26, 26), (57023, 99384)];
+        let tests2 = [
+            SLoc("", 0, 0),
+            SLoc("", 1, 3),
+            SLoc("", 26, 26),
+            SLoc("", 57023, 99384),
+        ];
         for t in tests {
-            let forward = is_ref(t).unwrap();
-            let inv = show_ref(&forward);
+            let forward = is_ref(t, "").unwrap();
+            let inv = show_ref_global(&forward);
             assert_eq!(t, inv);
         }
         for t in tests2 {
-            let forward = show_ref(&t);
-            let inv = is_ref(&forward);
+            let forward = show_ref_global(&t);
+            let inv = is_ref(&forward, "");
             assert_eq!(Some(t), inv);
         }
     }
@@ -3850,21 +4492,21 @@ mod test {
     }
     #[test]
     fn spec_method() {
-        let mut s = SpecValues::from_sloc((1, 1));
-        assert_eq!(s.to_sloc(), (1, 1));
+        let mut s = SpecValues::from_sloc(SLoc("", 1, 1));
+        assert_eq!(s.to_sloc(), SLoc("", 1, 1));
         assert!(!s.invalid_depth(0));
         s.depth = 5;
         assert!(!s.invalid_depth(5));
         assert!(!s.invalid_depth(0));
         assert!(s.invalid_depth(6));
-        s = s.with_sloc((2, 2));
-        assert_eq!(s.to_sloc(), (2, 2));
+        s = s.with_sloc(SLoc("", 2, 2));
+        assert_eq!(s.to_sloc(), SLoc("", 2, 2));
         assert_eq!(s.depth, 6);
-        s = s.with_f_sloc(Some(((2, 2), ConstType::Bool(false).into())));
+        s = s.with_f_sloc(Some((SLoc("", 2, 2), ConstType::Bool(false).into())));
         assert_eq!(s.depth, 7);
         s = s.with_f_sloc(None);
         assert_eq!(s.depth, 8);
-        s = s.with_s_sloc(Some((2, 2)));
+        s = s.with_s_sloc(Some(SLoc("", 2, 2)));
         assert_eq!(s.depth, 9);
         s = s.with_s_sloc(None);
         assert_eq!(s.depth, 10);
@@ -3932,20 +4574,20 @@ mod test {
     #[test]
     fn formula_parse() {
         assert_eq!(
-            form_tree(&split_parens(&form_tokens("78")).unwrap()),
+            form_tree(&split_parens(&form_tokens("78")).unwrap(), ""),
             (Value::Const(ConstType::Num(78.).into()), false),
         );
         assert_eq!(
-            form_tree(&split_parens(&form_tokens("A5")).unwrap()),
-            (Value::Ref((0, 4)), false),
+            form_tree(&split_parens(&form_tokens("A5")).unwrap(), ""),
+            (Value::Ref(SLoc("", 0, 4)), false),
         );
         assert_eq!(
-            form_tree(&split_parens(&form_tokens("A7+C5+3")).unwrap()),
+            form_tree(&split_parens(&form_tokens("A7+C5+3")).unwrap(), ""),
             (
                 Value::Add(
                     Rc::new(Value::Add(
-                        Rc::new(Value::Ref((0, 6))),
-                        Rc::new(Value::Ref((2, 4)))
+                        Rc::new(Value::Ref(SLoc("", 0, 6))),
+                        Rc::new(Value::Ref(SLoc("", 2, 4)))
                     )),
                     Rc::new(Value::Const(ConstType::Num(3.).into()))
                 ),
@@ -3953,15 +4595,18 @@ mod test {
             ),
         );
         assert_eq!(
-            form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap()),
+            form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap(), ""),
             (
                 Value::Add(
                     Rc::new(Value::Const(ConstType::Num(5.).into())),
                     Rc::new(Value::Func {
                         name: "sum".into(),
                         args: vec![Value::Const(
-                            ConstType::Range(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
-                                .into()
+                            ConstType::Range(Range(
+                                SLoc("", 0, 0),
+                                SLocBound(Bound::Fin(0), Bound::Inf)
+                            ))
+                            .into()
                         )]
                     })
                 ),
@@ -3969,15 +4614,18 @@ mod test {
             ),
         );
         assert_eq!(
-            form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap()),
+            form_tree(&split_parens(&form_tokens("5+sum(A1:A)")).unwrap(), ""),
             (
                 Value::Add(
                     Rc::new(Value::Const(ConstType::Num(5.).into())),
                     Rc::new(Value::Func {
                         name: "sum".into(),
                         args: vec![Value::Const(
-                            ConstType::Range(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Inf)))
-                                .into()
+                            ConstType::Range(Range(
+                                SLoc("", 0, 0),
+                                SLocBound(Bound::Fin(0), Bound::Inf)
+                            ))
+                            .into()
                         )]
                     })
                 ),
@@ -3985,7 +4633,7 @@ mod test {
             ),
         );
         assert_eq!(
-            form_tree(&split_parens(&form_tokens("range(1,1,5,A3)")).unwrap()),
+            form_tree(&split_parens(&form_tokens("range(1,1,5,A3)")).unwrap(), ""),
             (
                 Value::Func {
                     name: "range".into(),
@@ -3993,7 +4641,7 @@ mod test {
                         Value::Const(ConstType::Num(1.).into()),
                         Value::Const(ConstType::Num(1.).into()),
                         Value::Const(ConstType::Num(5.).into()),
-                        Value::Ref((0, 2))
+                        Value::Ref(SLoc("", 0, 2))
                     ]
                 },
                 false
@@ -4001,7 +4649,8 @@ mod test {
         );
         assert_eq!(
             form_tree(
-                &split_parens(&dbg!(form_tokens("if(sum(A1:B)<20, 20, \"Small\")"))).unwrap()
+                &split_parens(&dbg!(form_tokens("if(sum(A1:B)<20, 20, \"Small\")"))).unwrap(),
+                ""
             ),
             (
                 Value::Func {
@@ -4012,7 +4661,7 @@ mod test {
                                 name: "sum".into(),
                                 args: vec![Value::Const(
                                     ConstType::Range(Range(
-                                        (0, 0),
+                                        SLoc("", 0, 0),
                                         SLocBound(Bound::Fin(1), Bound::Inf)
                                     ))
                                     .into()
@@ -4029,7 +4678,10 @@ mod test {
             ),
         );
         assert_eq!(
-            form_tree(&split_parens(&dbg!(form_tokens("sum(range(0,0,10,10), 20)"))).unwrap()),
+            form_tree(
+                &split_parens(&dbg!(form_tokens("sum(range(0,0,10,10), 20)"))).unwrap(),
+                ""
+            ),
             (
                 Value::Func {
                     name: "sum".into(),
@@ -4055,7 +4707,8 @@ mod test {
                 &split_parens(&dbg!(form_tokens(
                     "if(3<1, \"\\\\String1\", \"S2\\\\\\\"\")"
                 )))
-                .unwrap()
+                .unwrap(),
+                ""
             ),
             (
                 Value::Func {
@@ -4076,7 +4729,7 @@ mod test {
     #[test]
     fn func_range_test() {
         let mut sheet = Sheet::new();
-        let spec = SpecValues::from_sloc((0, 0));
+        let spec = SpecValues::from_sloc(SLoc("", 0, 0));
         // sheet.insert((0,0), )
         assert_eq!(RangeFunc.name(), "range");
         assert_eq!(
@@ -4093,7 +4746,10 @@ mod test {
                 &sheet.ranges,
                 &spec
             ),
-            vec![Range((1, 1), SLocBound(Bound::Fin(3), Bound::Fin(3)))]
+            vec![Range(
+                SLoc("", 1, 1),
+                SLocBound(Bound::Fin(3), Bound::Fin(3))
+            )]
         );
         assert_eq!(
             RangeFunc.call(
@@ -4109,7 +4765,11 @@ mod test {
                 &sheet.ranges,
                 &spec
             ),
-            ConstType::Range(Range((1, 1), SLocBound(Bound::Fin(3), Bound::Fin(3)))).into()
+            ConstType::Range(Range(
+                SLoc("", 1, 1),
+                SLocBound(Bound::Fin(3), Bound::Fin(3))
+            ))
+            .into()
         );
         assert_eq!(
             RangeFunc.get_refs(
@@ -4123,7 +4783,7 @@ mod test {
                 &sheet.ranges,
                 &spec
             ),
-            vec![Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))]
+            vec![Range(SLoc("", 1, 1), SLocBound(Bound::Inf, Bound::Inf))]
         );
         assert_eq!(
             RangeFunc.call(
@@ -4137,7 +4797,7 @@ mod test {
                 &sheet.ranges,
                 &spec
             ),
-            ConstType::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))).into()
+            ConstType::Range(Range(SLoc("", 1, 1), SLocBound(Bound::Inf, Bound::Inf))).into()
         );
         assert_eq!(
             RangeFunc.get_refs(
@@ -4187,7 +4847,7 @@ mod test {
                 &sheet.ranges,
                 &spec
             ),
-            vec![Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))]
+            vec![Range(SLoc("", 1, 1), SLocBound(Bound::Inf, Bound::Inf))]
         );
         assert_eq!(
             RangeFunc.call(
@@ -4201,7 +4861,7 @@ mod test {
                 &sheet.ranges,
                 &spec
             ),
-            ConstType::Range(Range((1, 1), SLocBound(Bound::Inf, Bound::Inf))).into()
+            ConstType::Range(Range(SLoc("", 1, 1), SLocBound(Bound::Inf, Bound::Inf))).into()
         );
         assert_eq!(
             RangeFunc.get_refs(
@@ -4637,41 +5297,41 @@ mod test {
     fn common_usage() {
         let mut sheet = Sheet::new();
         assert!(sheet
-            .insert((0, 0), CellData::default().val("2".into()),)
+            .insert(SLoc("", 0, 0), CellData::default().val("2".into()),)
             .is_none());
         assert!(sheet
-            .insert((0, 1), CellData::default().val("3".into()))
+            .insert(SLoc("", 0, 1), CellData::default().val("3".into()))
             .is_none());
 
         assert!(sheet
-            .insert((1, 0), CellData::default().val("=A1+A2".into()),)
+            .insert(SLoc("", 1, 0), CellData::default().val("=A1+A2".into()),)
             .is_none());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("3".into())
                 .val("3".into())
                 .display(Some(ConstType::Num(3.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
 
         assert_eq!(
-            sheet.get(&(1, 0)),
+            sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
                 .val("=A1+A2".into())
                 .display(Some(ConstType::Num(5.).into())))
         );
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=9e9e9".into())
                     .display(None)
@@ -4680,7 +5340,7 @@ mod test {
             .is_some());
         sheet.recompute();
         // dbg!(&sheet);
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(d.val, "=9e9e9");
         // assert!(d
         //     .display
@@ -4699,7 +5359,7 @@ mod test {
         ));
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=".into())
                     .display(None)
@@ -4708,7 +5368,7 @@ mod test {
             .is_some());
         sheet.recompute();
         // dbg!(&sheet);
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(d.val, "=");
         // assert!(d
         //     .display
@@ -4726,8 +5386,8 @@ mod test {
             })
         ));
 
-        sheet.set_disp(&(1, 0), None);
-        let d = sheet.get(&(1, 0)).unwrap();
+        sheet.set_disp(&SLoc("", 1, 0), None);
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -4736,10 +5396,10 @@ mod test {
                 .deps([].into_iter().collect())
         );
         sheet.set_disp(
-            &(1, 0),
+            &SLoc("", 1, 0),
             Some(ConstType::from_str("\"Not error\"").unwrap().into()),
         );
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -4748,41 +5408,41 @@ mod test {
                 .deps([].into_iter().collect())
         );
         sheet.set_disp_err(
-            &(1, 0),
+            &SLoc("", 1, 0),
             CellError::MissingCell {
-                cell: Some((100, 100)),
+                cell: Some(SLoc("", 100, 100)),
             },
         );
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
                 .val("=".into())
                 .display(Some(Const {
                     ct: ConstType::Error(CellError::MissingCell {
-                        cell: Some((100, 100))
+                        cell: Some(SLoc("", 100, 100))
                     }),
                     ..Const::default_err()
                 }))
                 .deps([].into_iter().collect()),
         );
-        assert!(sheet.contains_key(&(0, 0)));
-        assert!(!sheet.contains_key(&(2, 2)));
+        assert!(sheet.contains_key(&SLoc("", 0, 0)));
+        assert!(!sheet.contains_key(&SLoc("", 2, 2)));
 
         assert_eq!(
-            sheet.get_display(&(1, 0)),
+            sheet.get_display(&SLoc("", 1, 0)),
             Some(
                 ConstType::Error(CellError::MissingCell {
-                    cell: Some((100, 100))
+                    cell: Some(SLoc("", 100, 100))
                 })
                 .into()
             )
         );
         assert_eq!(sheet.iter().count(), 3);
         assert_eq!(sheet.iter_mut().count(), 3);
-        assert!(sheet.iter().all(|(x, _)| x.0 < 2 && x.1 < 2));
+        assert!(sheet.iter().all(|(x, _)| x.1 < 2 && x.2 < 2));
         assert_eq!(
-            sheet.val_mut(&(0, 0)),
+            sheet.val_mut(&SLoc("", 0, 0)),
             Some(Box::leak(Box::new("2".into())))
         );
     }
@@ -4791,14 +5451,14 @@ mod test {
     fn sum() {
         let mut sheet = Sheet::new();
         assert!(sheet
-            .insert((0, 0), CellData::default().val("2".into()),)
+            .insert(SLoc("", 0, 0), CellData::default().val("2".into()),)
             .is_none());
         assert!(sheet
-            .insert((0, 1), CellData::default().val("3".into()))
+            .insert(SLoc("", 0, 1), CellData::default().val("3".into()))
             .is_none());
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=sum(A1:A10)".into())
                     .display(None)
@@ -4808,21 +5468,21 @@ mod test {
         sheet.recompute();
         // dbg!(.&sheet);
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("3".into())
                 .display(Some(ConstType::Num(3.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(1, 0)),
+            sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
                 .val("=sum(A1:A10)".into())
                 .display(Some(ConstType::Num(5.).into()))
@@ -4833,17 +5493,17 @@ mod test {
     fn if_test() {
         let mut sheet = Sheet::new();
         assert!(sheet
-            .insert((0, 0), CellData::default().val("2".into()),)
+            .insert(SLoc("", 0, 0), CellData::default().val("2".into()),)
             .is_none());
         assert!(sheet
-            .insert((0, 1), CellData::default().val("3".into()))
+            .insert(SLoc("", 0, 1), CellData::default().val("3".into()))
             .is_none());
         assert!(sheet
-            .insert((1, 1), CellData::default().val("0.6".into()))
+            .insert(SLoc("", 1, 1), CellData::default().val("0.6".into()))
             .is_none());
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=if(A1<A2, A2, A1)".into())
                     .display(None)
@@ -4852,21 +5512,21 @@ mod test {
             .is_none());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("3".into())
                 .display(Some(ConstType::Num(3.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(1, 0)),
+            sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
                 .val("=if(A1<A2, A2, A1)".into())
                 .display(Some(ConstType::Num(3.).into()))
@@ -4875,7 +5535,7 @@ mod test {
 
         assert!(sheet
             .insert(
-                (0, 0),
+                SLoc("", 0, 0),
                 CellData::default()
                     .val("=7".into())
                     .display(None)
@@ -4885,21 +5545,21 @@ mod test {
         sheet.recompute();
         // dbg!(&sheet);
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("=7".into())
                 .display(Some(ConstType::Num(7.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("3".into())
                 .display(Some(ConstType::Num(3.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(1, 0)),
+            sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
                 .val("=if(A1<A2, A2, A1)".into())
                 .display(Some(ConstType::Num(7.).into()))
@@ -4907,7 +5567,7 @@ mod test {
         );
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=if(A1<A2 & B2<A2, A2, B2)*2".into())
                     .display(None)
@@ -4915,7 +5575,7 @@ mod test {
             )
             .is_some());
         sheet.recompute();
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -4925,7 +5585,7 @@ mod test {
         );
         assert!(sheet
             .insert(
-                (0, 0),
+                SLoc("", 0, 0),
                 CellData::default()
                     .val("1".into())
                     .display(None)
@@ -4933,7 +5593,7 @@ mod test {
             )
             .is_some());
         sheet.recompute();
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -4945,7 +5605,7 @@ mod test {
         dbg!(&sheet);
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=if(A1>A2, A2, A1)".into())
                     .display(None)
@@ -4954,21 +5614,21 @@ mod test {
             .is_some());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("1".into())
                 .display(Some(ConstType::Num(1.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("3".into())
                 .display(Some(ConstType::Num(3.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(1, 0)),
+            sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
                 .val("=if(A1>A2, A2, A1)".into())
                 .display(Some(ConstType::Num(1.).into()))
@@ -4980,17 +5640,17 @@ mod test {
     fn range() {
         let mut sheet = Sheet::new();
         assert!(sheet
-            .insert((0, 0), CellData::default().val("2".into()),)
+            .insert(SLoc("", 0, 0), CellData::default().val("2".into()),)
             .is_none());
         assert!(sheet
-            .insert((0, 1), CellData::default().val("3".into()))
+            .insert(SLoc("", 0, 1), CellData::default().val("3".into()))
             .is_none());
         assert!(sheet
-            .insert((0, 6), CellData::default().val("3".into()))
+            .insert(SLoc("", 0, 6), CellData::default().val("3".into()))
             .is_none());
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=sum(range(0,0,0,10),value(0,1))".into())
                     .display(None)
@@ -4999,25 +5659,25 @@ mod test {
             .is_none());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("3".into())
                 .display(Some(ConstType::Num(3.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(d.display, Some(ConstType::Num(11.).into()));
 
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=sum(range(0,0,0,B2),value(0,1))".into())
                     .display(None)
@@ -5026,7 +5686,7 @@ mod test {
             .is_some());
         assert!(sheet
             .insert(
-                (1, 1),
+                SLoc("", 1, 1),
                 CellData::default()
                     .val("-1".into())
                     .display(None)
@@ -5035,25 +5695,25 @@ mod test {
             .is_none());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
                 .deps(HashSet::new()))
         );
         assert_eq!(
-            sheet.get(&(1, 1)),
+            sheet.get(&SLoc("", 1, 1)),
             Ok(&CellData::default()
                 .val("-1".into())
                 .display(Some(ConstType::Num(-1.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d.display,
             Some(Const {
                 ct: ConstType::Error(CellError::BadArgument {
-                    cell: Some((1, 0)),
+                    cell: Some(SLoc("", 1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
                 }),
@@ -5062,7 +5722,7 @@ mod test {
         );
         assert!(sheet
             .insert(
-                (1, 1),
+                SLoc("", 1, 1),
                 CellData::default()
                     .val("0.6".into())
                     .display(None)
@@ -5071,25 +5731,25 @@ mod test {
             .is_some());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
                 .deps(HashSet::new()))
         );
         assert_eq!(
-            sheet.get(&(1, 1)),
+            sheet.get(&SLoc("", 1, 1)),
             Ok(&CellData::default()
                 .val("0.6".into())
                 .display(Some(ConstType::Num(0.6).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d.display,
             Some(Const {
                 ct: ConstType::Error(CellError::BadArgument {
-                    cell: Some((1, 0)),
+                    cell: Some(SLoc("", 1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
                 }),
@@ -5099,7 +5759,7 @@ mod test {
 
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=sum(range(0,0,B2,10),value(0,1))".into())
                     .display(None)
@@ -5108,7 +5768,7 @@ mod test {
             .is_some());
         assert!(sheet
             .insert(
-                (1, 1),
+                SLoc("", 1, 1),
                 CellData::default()
                     .val("-1".into())
                     .display(None)
@@ -5117,25 +5777,25 @@ mod test {
             .is_some());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
                 .deps(HashSet::new()))
         );
         assert_eq!(
-            sheet.get(&(1, 1)),
+            sheet.get(&SLoc("", 1, 1)),
             Ok(&CellData::default()
                 .val("-1".into())
                 .display(Some(ConstType::Num(-1.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d.display,
             Some(Const {
                 ct: ConstType::Error(CellError::BadArgument {
-                    cell: Some((1, 0)),
+                    cell: Some(SLoc("", 1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
                 }),
@@ -5144,7 +5804,7 @@ mod test {
         );
         assert!(sheet
             .insert(
-                (1, 1),
+                SLoc("", 1, 1),
                 CellData::default()
                     .val("0.6".into())
                     .display(None)
@@ -5153,25 +5813,25 @@ mod test {
             .is_some());
         sheet.recompute();
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
                 .display(Some(ConstType::Num(2.).into()))
                 .deps(HashSet::new()))
         );
         assert_eq!(
-            sheet.get(&(1, 1)),
+            sheet.get(&SLoc("", 1, 1)),
             Ok(&CellData::default()
                 .val("0.6".into())
                 .display(Some(ConstType::Num(0.6).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d.display,
             Some(Const {
                 ct: ConstType::Error(CellError::BadArgument {
-                    cell: Some((1, 0)),
+                    cell: Some(SLoc("", 1, 0)),
                     cursor: 0,
                     expected_types: vec!["Whole number".into(), ".I".into()]
                 }),
@@ -5183,18 +5843,18 @@ mod test {
     fn countif() {
         let mut sheet = Sheet::new();
         assert!(sheet
-            .insert((0, 0), CellData::default().val("2".into()),)
+            .insert(SLoc("", 0, 0), CellData::default().val("2".into()),)
             .is_none());
         assert!(sheet
-            .insert((0, 1), CellData::default().val("3".into()))
+            .insert(SLoc("", 0, 1), CellData::default().val("3".into()))
             .is_none());
         assert!(sheet
-            .insert((0, 2), CellData::default().val("1".into()))
+            .insert(SLoc("", 0, 2), CellData::default().val("1".into()))
             .is_none());
 
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=countif(A1:A10, .F.<4)".into())
                     .display(None)
@@ -5203,7 +5863,7 @@ mod test {
             .is_none());
         sheet.recompute();
         dbg!(&sheet);
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -5213,7 +5873,7 @@ mod test {
         );
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=countif(A1:A10, .F.<2)".into())
                     .display(None)
@@ -5221,7 +5881,7 @@ mod test {
             )
             .is_some());
         sheet.recompute();
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -5232,7 +5892,7 @@ mod test {
 
         assert!(sheet
             .insert(
-                (1, 0),
+                SLoc("", 1, 0),
                 CellData::default()
                     .val("=countif(A1:B10, .F.<2)".into())
                     .display(None)
@@ -5241,24 +5901,24 @@ mod test {
             .is_some());
         eprintln!("Detect recursive");
         sheet.recompute();
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
                 .val("=countif(A1:B10, .F.<2)".into())
                 .display(Some(
                     ConstType::Error(CellError::ReferenceLoop {
-                        loop_point: Some((1, 0))
+                        loop_point: Some(SLoc("", 1, 0))
                     })
                     .into()
                 ))
-                .deps([(1, 0)].into_iter().collect())
+                .deps([SLoc("", 1, 0)].into_iter().collect())
         );
         eprintln!("recursive done");
 
-        *sheet.val_mut(&(1, 0)).unwrap() = "=countif(A1:A10, .F.=4)-7".into();
+        *sheet.val_mut(&SLoc("", 1, 0)).unwrap() = "=countif(A1:A10, .F.=4)-7".into();
         sheet.recompute();
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -5266,9 +5926,9 @@ mod test {
                 .display(Some(ConstType::Num(-7.).into()))
                 .deps(HashSet::new())
         );
-        *sheet.val_mut(&(1, 0)).unwrap() = "=countif(A1:A10, .F.=1)/2".into();
+        *sheet.val_mut(&SLoc("", 1, 0)).unwrap() = "=countif(A1:A10, .F.=1)/2".into();
         sheet.recompute();
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -5281,20 +5941,23 @@ mod test {
     fn value() {
         let mut sheet = Sheet::new();
         assert!(sheet
-            .insert((0, 0), CellData::default().val("2".into()),)
+            .insert(SLoc("", 0, 0), CellData::default().val("2".into()),)
             .is_none());
         assert!(sheet
-            .insert((0, 1), CellData::default().val("3".into()))
+            .insert(SLoc("", 0, 1), CellData::default().val("3".into()))
             .is_none());
         assert!(sheet
-            .insert((1, 1), CellData::default().val("4".into()))
+            .insert(SLoc("", 1, 1), CellData::default().val("4".into()))
             .is_none());
-        // *sheet.val_mut(&(1, 0)).unwrap() = "=value(0,1)".into();
+        // *sheet.val_mut(&SLoc("", 1, 0)).unwrap() = "=value(0,1)".into();
         assert!(sheet
-            .insert((1, 0), CellData::default().val("=value(0,1)".into()))
+            .insert(
+                SLoc("", 1, 0),
+                CellData::default().val("=value(0,1)".into())
+            )
             .is_none());
         sheet.recompute();
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
@@ -5303,119 +5966,122 @@ mod test {
                 .deps(HashSet::new())
         );
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("3".into())
                 .display(Some(ConstType::Num(3.).into()))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         // dbg!(&sheet);
-        sheet.remove(&(0, 1));
+        sheet.remove(&SLoc("", 0, 1));
         sheet.recompute();
         // dbg!(&sheet);
-        let d = sheet.get(&(1, 0)).unwrap();
+        let d = sheet.get(&SLoc("", 1, 0)).unwrap();
         assert_eq!(
             d,
             &CellData::default()
                 .val("=value(0,1)".into())
                 .display(Some(
-                    ConstType::Error(CellError::MissingCell { cell: Some((0, 1)) }).into()
+                    ConstType::Error(CellError::MissingCell {
+                        cell: Some(SLoc("", 0, 1))
+                    })
+                    .into()
                 ))
                 .deps(HashSet::new())
         );
 
-        sheet.set_val(&(1, 0), "=value(0,1)+value(0,0)+value(1,1)".into());
-        sheet.set_val(&(0, 1), "5".into());
+        sheet.set_val(&SLoc("", 1, 0), "=value(0,1)+value(0,0)+value(1,1)".into());
+        sheet.set_val(&SLoc("", 0, 1), "5".into());
         sheet.recompute();
         // dbg!(&sheet);
         assert_eq!(
-            sheet.get(&(1, 0)),
+            sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
                 .val("=value(0,1)+value(0,0)+value(1,1)".into())
                 .display(Some(ConstType::Num(11.).into()))
                 .deps(HashSet::new()))
         );
         assert_eq!(
-            sheet.get(&(0, 0)),
+            sheet.get(&SLoc("", 0, 0)),
             Ok(&CellData::default()
                 .val("2".into())
-                .deps([(1, 0)].into_iter().collect())
+                .deps([SLoc("", 1, 0)].into_iter().collect())
                 .display(Some(ConstType::Num(2.).into())))
         );
-        sheet.set_val(&(0, 1), "=value(1,0)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(1,0)".into());
         eprintln!("before loop");
         sheet.recompute();
 
         assert_eq!(
-            sheet.get(&(0, 1)),
+            sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
                 .val("=value(1,0)".into())
                 .display(Some(
                     ConstType::Error(CellError::ReferenceLoop {
-                        loop_point: Some((0, 1))
+                        loop_point: Some(SLoc("", 0, 1))
                     })
                     .into()
                 ))
-                .deps([(1, 0)].into_iter().collect()))
+                .deps([SLoc("", 1, 0)].into_iter().collect()))
         );
         assert_eq!(
-            sheet.get(&(1, 0)),
+            sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
                 .val("=value(0,1)+value(0,0)+value(1,1)".into())
                 .display(Some(
                     ConstType::Error(CellError::ReferenceLoop {
-                        loop_point: Some((0, 1))
+                        loop_point: Some(SLoc("", 0, 1))
                     })
                     .into()
                 ))
-                .deps([(0, 1)].into_iter().collect()))
+                .deps([SLoc("", 0, 1)].into_iter().collect()))
         );
-        sheet.set_val(&(0, 1), "=value(-1,0)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(-1,0)".into());
         sheet.recompute();
         assert_eq!(
-            sheet.get_display(&(0, 1)),
+            sheet.get_display(&SLoc("", 0, 1)),
             Some(
                 ConstType::Error(CellError::BadArgument {
-                    cell: Some((0, 1)),
+                    cell: Some(SLoc("", 0, 1)),
                     cursor: 0,
                     expected_types: vec!["whole number".into()]
                 })
                 .into()
             )
         );
-        sheet.set_val(&(0, 1), "=value(0, -1)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(0, -1)".into());
         sheet.recompute();
         assert_eq!(
-            sheet.get_display(&(0, 1)),
+            sheet.get_display(&SLoc("", 0, 1)),
             Some(
                 ConstType::Error(CellError::BadArgument {
-                    cell: Some((0, 1)),
+                    cell: Some(SLoc("", 0, 1)),
                     cursor: 0,
                     expected_types: vec!["whole number".into()]
                 })
                 .into()
             )
         );
-        sheet.set_val(&(0, 1), "=value(0.7,0)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(0.7,0)".into());
         sheet.recompute();
         assert_eq!(
-            sheet.get_display(&(0, 1)),
+            sheet.get_display(&SLoc("", 0, 1)),
             Some(
                 ConstType::Error(CellError::BadArgument {
-                    cell: Some((0, 1)),
+                    cell: Some(SLoc("", 0, 1)),
                     cursor: 0,
                     expected_types: vec!["whole number".into()]
                 })
                 .into()
             )
         );
-        sheet.set_val(&(0, 1), "=value(0, 0.7)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(0, 0.7)".into());
         sheet.recompute();
         assert_eq!(
-            sheet.get_display(&(0, 1)),
+            sheet.get_display(&SLoc("", 0, 1)),
             Some(
                 ConstType::Error(CellError::BadArgument {
-                    cell: Some((0, 1)),
+                    cell: Some(SLoc("", 0, 1)),
                     cursor: 0,
                     expected_types: vec!["whole number".into()]
                 })
@@ -5426,62 +6092,71 @@ mod test {
     #[test]
     fn recurse() {
         let mut sheet = Sheet::new();
-        sheet.set_val(&(0, 0), "=A2+1".to_owned());
-        sheet.set_val(&(0, 1), "=B1*2".to_owned());
-        sheet.set_val(&(1, 0), "=A1-1".to_owned());
+        sheet.set_val(&SLoc("", 0, 0), "=A2+1".to_owned());
+        sheet.set_val(&SLoc("", 0, 1), "=B1*2".to_owned());
+        sheet.set_val(&SLoc("", 1, 0), "=A1-1".to_owned());
         sheet.recompute();
         // dbg!(&sheet);
         assert_eq!(
-            sheet.get(&(0, 0)).unwrap().display,
+            sheet.get(&SLoc("", 0, 0)).unwrap().display,
             Some(
                 ConstType::Error(CellError::ReferenceLoop {
-                    loop_point: Some((0, 0))
+                    loop_point: Some(SLoc("", 0, 0))
                 })
                 .into()
             )
         );
-        sheet.set_val(&(1, 0), "=1".to_owned());
+        sheet.set_val(&SLoc("", 1, 0), "=1".to_owned());
         sheet.recompute();
         dbg!(&sheet);
         assert_eq!(
-            sheet.get(&(0, 0)).unwrap().display,
+            sheet.get(&SLoc("", 0, 0)).unwrap().display,
             Some(ConstType::Num(3.).into())
         );
-        sheet.set_disp(&(0, 0), Some(ConstType::String("123".into()).into()));
+        sheet.set_disp(
+            &SLoc("", 0, 0),
+            Some(ConstType::String("123".into()).into()),
+        );
         assert_eq!(
-            sheet.get(&(0, 0)).unwrap().display,
+            sheet.get(&SLoc("", 0, 0)).unwrap().display,
             Some(ConstType::String("123".into()).into())
         );
     }
     #[test]
     fn range_iter() {
-        let range = Range((0, 0), SLocBound(Bound::Inf, Bound::Fin(5)));
+        let range = Range(SLoc("", 0, 0), SLocBound(Bound::Inf, Bound::Fin(5)));
         let rangeiter: Result<FinRangeIter, _> = range.try_into();
         assert_eq!(rangeiter, Err("Not a finite range"));
-        let range = Range((0, 0), SLocBound(Bound::Fin(5), Bound::Inf));
+        let range = Range(SLoc("", 0, 0), SLocBound(Bound::Fin(5), Bound::Inf));
         let rangeiter: Result<FinRangeIter, _> = range.try_into();
         assert_eq!(rangeiter, Err("Not a finite range"));
-        let range = Range((1, 1), SLocBound(Bound::Fin(5), Bound::Fin(6)));
+        let range = Range(SLoc("", 1, 1), SLocBound(Bound::Fin(5), Bound::Fin(6)));
         let rangeiter: FinRangeIter = range.try_into().unwrap();
         let locs: Vec<_> = rangeiter.collect();
         dbg!(&locs);
         assert_eq!(locs.len(), 30);
-        assert_eq!(&locs[0..3], &[(1, 1), (2, 1), (3, 1)]);
-        assert_eq!(&locs[27..30], &[(3, 6), (4, 6), (5, 6)]);
+        assert_eq!(
+            &locs[0..3],
+            &[SLoc("", 1, 1), SLoc("", 2, 1), SLoc("", 3, 1)]
+        );
+        assert_eq!(
+            &locs[27..30],
+            &[SLoc("", 3, 6), SLoc("", 4, 6), SLoc("", 5, 6)]
+        );
     }
     #[test]
     fn range_formula_parse() {
-        assert_eq!(is_range_formula("=5"), Err("Range missing brackets"));
+        assert_eq!(is_range_formula("=5", ""), Err("Range missing brackets"));
         assert_eq!(
-            is_range_formula("[]=5"),
+            is_range_formula("[]=5", ""),
             Err("First argument must be a number or .I")
         );
         assert_eq!(
-            is_range_formula("[0,]=5"),
+            is_range_formula("[0,]=5", ""),
             Err("Second argument must be a number or .I")
         );
         assert_eq!(
-            is_range_formula("[0,2]=").unwrap(),
+            is_range_formula("[0,2]=", "").unwrap(),
             RangeFormula {
                 rbound: Bound::Fin(2),
                 cbound: Bound::Fin(0),
@@ -5493,20 +6168,20 @@ mod test {
                         reason: "No formula given"
                     })
                     .into()
-                )
+                ),
             }
         );
         assert_eq!(
-            is_range_formula("[0,.I]=5").unwrap(),
+            is_range_formula("[0,.I]=5", "").unwrap(),
             RangeFormula {
                 rbound: Bound::Inf,
                 cbound: Bound::Fin(0),
                 conditon: Value::Const(ConstType::Bool(true).into()),
-                value: Value::Const(ConstType::Num(5.).into())
+                value: Value::Const(ConstType::Num(5.).into()),
             }
         );
         assert_eq!(
-            is_range_formula("[0,.I,]=5").unwrap(),
+            is_range_formula("[0,.I,]=5", "").unwrap(),
             RangeFormula {
                 rbound: Bound::Inf,
                 cbound: Bound::Fin(0),
@@ -5518,28 +6193,28 @@ mod test {
                     })
                     .into()
                 ),
-                value: Value::Const(ConstType::Num(5.).into())
+                value: Value::Const(ConstType::Num(5.).into()),
             }
         );
         assert_eq!(
-            is_range_formula("[0,.I,A1<3]=5").unwrap(),
+            is_range_formula("[0,.I,A1<3]=5", "").unwrap(),
             RangeFormula {
                 rbound: Bound::Inf,
                 cbound: Bound::Fin(0),
                 conditon: Value::Lt(
-                    Rc::new(Value::Ref((0, 0))),
+                    Rc::new(Value::Ref(SLoc("", 0, 0))),
                     Rc::new(Value::Const(ConstType::Num(3.).into()))
                 ),
-                value: Value::Const(ConstType::Num(5.).into())
+                value: Value::Const(ConstType::Num(5.).into()),
             }
         );
         assert_eq!(
-            is_range_formula("[.I,0,A1<3]=5+3").unwrap(),
+            is_range_formula("[.I,0,A1<3]=5+3", "").unwrap(),
             RangeFormula {
                 rbound: Bound::Fin(0),
                 cbound: Bound::Inf,
                 conditon: Value::Lt(
-                    Rc::new(Value::Ref((0, 0))),
+                    Rc::new(Value::Ref(SLoc("", 0, 0))),
                     Rc::new(Value::Const(ConstType::Num(3.).into()))
                 ),
                 value: Value::Add(
@@ -5548,28 +6223,34 @@ mod test {
                 ),
             }
         );
-        let rf = Value::RangeForm(Rc::new(is_range_formula("[.I,0]=1").unwrap()));
+        let rf = Value::RangeForm(Rc::new(is_range_formula("[.I,0]=1", "").unwrap()));
         assert_eq!(
-            rf.is_range_formula(&SpecValues::from_sloc((0, 0))),
-            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Fin(0))))
+            rf.is_range_formula(&SpecValues::from_sloc(SLoc("", 0, 0))),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Inf, Bound::Fin(0))))
         );
-        let rf = Value::RangeForm(Rc::new(is_range_formula("[3,0]=1").unwrap()));
+        let rf = Value::RangeForm(Rc::new(is_range_formula("[3,0]=1", "").unwrap()));
         assert_eq!(
-            rf.is_range_formula(&SpecValues::from_sloc((0, 0))),
-            Some(Range((0, 0), SLocBound(Bound::Fin(3), Bound::Fin(0))))
+            rf.is_range_formula(&SpecValues::from_sloc(SLoc("", 0, 0))),
+            Some(Range(
+                SLoc("", 0, 0),
+                SLocBound(Bound::Fin(3), Bound::Fin(0))
+            ))
         );
-        let rf = Value::RangeForm(Rc::new(is_range_formula("[.I,.I]=1").unwrap()));
+        let rf = Value::RangeForm(Rc::new(is_range_formula("[.I,.I]=1", "").unwrap()));
         assert_eq!(
-            rf.is_range_formula(&SpecValues::from_sloc((0, 0))),
-            Some(Range((0, 0), SLocBound(Bound::Inf, Bound::Inf)))
+            rf.is_range_formula(&SpecValues::from_sloc(SLoc("", 0, 0))),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Inf, Bound::Inf)))
         );
-        let rf = Value::RangeForm(Rc::new(is_range_formula("[3,.I]=1").unwrap()));
+        let rf = Value::RangeForm(Rc::new(is_range_formula("[3,.I]=1", "").unwrap()));
         assert_eq!(
-            rf.is_range_formula(&SpecValues::from_sloc((0, 0))),
-            Some(Range((0, 0), SLocBound(Bound::Fin(3), Bound::Inf)))
+            rf.is_range_formula(&SpecValues::from_sloc(SLoc("", 0, 0))),
+            Some(Range(SLoc("", 0, 0), SLocBound(Bound::Fin(3), Bound::Inf)))
         );
         let rf = Value::Const(ConstType::Bool(false).into());
-        assert_eq!(rf.is_range_formula(&SpecValues::from_sloc((0, 0))), None);
+        assert_eq!(
+            rf.is_range_formula(&SpecValues::from_sloc(SLoc("", 0, 0))),
+            None
+        );
     }
     #[test]
     fn truthy() {
@@ -5585,18 +6266,24 @@ mod test {
         let mut sheet = Sheet::new();
 
         assert!(sheet
-            .insert((0, 0), CellData::default().val("[0,.I]=.R".into()))
+            .insert(SLoc("", 0, 0), CellData::default().val("[0,.I]=.R".into()))
             .is_none());
-        sheet.recompute_range(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Fin(20))));
+        sheet.recompute_range(Range(
+            SLoc("", 0, 0),
+            SLocBound(Bound::Fin(0), Bound::Fin(20)),
+        ));
         // TODO not have to double this
-        sheet.recompute_range(Range((0, 0), SLocBound(Bound::Fin(0), Bound::Fin(20))));
+        sheet.recompute_range(Range(
+            SLoc("", 0, 0),
+            SLocBound(Bound::Fin(0), Bound::Fin(20)),
+        ));
         dbg!(&sheet);
         // dbg!(sheet.get(&(0, 10)));
         assert_eq!(
-            sheet.get_display(&(0, 10)),
+            sheet.get_display(&SLoc("", 0, 10)),
             Some(ConstType::Num(10.).into())
         );
-        assert_eq!(sheet.get_display(&(0, 21)), None);
-        assert_eq!(sheet.get_display(&(1, 1)), None);
+        assert_eq!(sheet.get_display(&SLoc("", 0, 21)), None);
+        assert_eq!(sheet.get_display(&SLoc("", 1, 1)), None);
     }
 }

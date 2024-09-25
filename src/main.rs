@@ -11,9 +11,10 @@ use std::{
 
 use flate2::Compression;
 use formula::{
-    get_range_form, show_ref, Acc, AccMode, AndFunc, CallFunc, CeilFunc, CellData, CellError,
-    ColorFunc, CountIf, FalseFunc, Function, If, OrFunc, PowFunc, Range, RangeFunc, RoundFunc,
-    SLocBound, TrueFunc, ValueFunc,
+    get_range_form, show_ref_local, Acc, AccMode, AndFunc, CallFunc, CeilFunc, CellData, CellError,
+    ColorFunc, ConstFunc, CountIf, FalseFunc, FilterFunc, Function, If, IntegrateFunc, LogFunc,
+    NumConstType, OrFunc, PowFunc, Range, RangeFunc, RoundFunc, SLocBound, SpecValues, TrueFunc,
+    Value, ValueFunc,
 };
 use sdl2::{
     event::{Event, WindowEvent},
@@ -33,7 +34,8 @@ const RED: Color = Color::RGB(200, 20, 20);
 
 // type Sheet = BTreeMap<(i32, i32), CellData>;
 // whut
-pub(crate) type SLoc = (i32, i32);
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SLoc(&'static str, i32, i32);
 #[derive(Debug)]
 pub(crate) struct SheetData(BTreeMap<SLoc, CellData>);
 pub(crate) type SheetEval = BTreeMap<SLoc, usize>;
@@ -98,7 +100,12 @@ impl Default for SheetFunc {
             Box::new(RoundFunc),
             Box::new(CeilFunc),
             Box::new(PowFunc),
+            Box::new(LogFunc),
+            Box::new(IntegrateFunc),
             Box::new(CallFunc),
+            Box::new(ConstFunc(NumConstType::Pi)),
+            Box::new(ConstFunc(NumConstType::E)),
+            Box::new(FilterFunc::default()),
         ])
     }
 }
@@ -151,6 +158,28 @@ impl Sheet {
     fn set_val(&mut self, cell: &SLoc, val: String) {
         self.data.set_val(cell, val);
         self.eval.insert(*cell, 0);
+    }
+    fn get_files(&self) -> HashSet<&'static str> {
+        self.data.0.iter().map(|(sloc, _)| sloc.0).collect()
+    }
+    fn get_linked_files(&mut self) -> HashSet<&'static str> {
+        self.data
+            .0
+            .iter()
+            .flat_map(|(sloc, cell)| {
+                let Ok(value) = Value::from_str(&cell.val, sloc.0) else {
+                    return vec![];
+                };
+                let refs = value.get_refs(
+                    &self.data,
+                    &mut self.eval,
+                    &self.funcs,
+                    &self.ranges,
+                    &SpecValues::from_sloc(*sloc),
+                );
+                refs.iter().map(|x| x.0 .0).collect()
+            })
+            .collect()
     }
 }
 impl Deref for Sheet {
@@ -370,6 +399,7 @@ fn main() {
     let cellh: i32 = 25;
     let menu = 48;
     let top: i32 = 96;
+    let tab_bottom: i32 = 35;
     let border = 2; // 4
     let mut height = 800;
     let mut width = 1200;
@@ -382,6 +412,12 @@ fn main() {
     let mainfont = sdlttf.load_font("UbuntuMono-Regular.ttf", 48).unwrap();
     let cellfont = sdlttf
         .load_font("UbuntuMono-Regular.ttf", cellh.try_into().unwrap())
+        .unwrap();
+    let tabfont = sdlttf
+        .load_font(
+            "UbuntuMono-Regular.ttf",
+            (tab_bottom - 4).try_into().unwrap(),
+        )
         .unwrap();
     let mut canvas = window.into_canvas().build().unwrap();
     let texturer = canvas.texture_creator();
@@ -403,10 +439,10 @@ fn main() {
         file = rfd::FileDialog::new()
             .set_title("Choose a .gg file")
             .add_filter("Gogebia", &["gg"])
-            .pick_file();
+            .save_file();
     }
 
-    if let Some(filen) = file {
+    fn load_file(filen: &'static str, data: &mut Sheet) {
         if let Ok(file_zipped) = std::fs::File::open(filen) {
             let filedata = flate2::read::GzDecoder::new(file_zipped);
             let file = csv::ReaderBuilder::new()
@@ -419,16 +455,46 @@ fn main() {
                 };
                 for (j, entry) in line.iter().enumerate() {
                     if !entry.is_empty() {
-                        data.insert((j as i32, i as i32), CellData::from_str(entry).unwrap());
+                        data.insert(
+                            SLoc(filen, j as i32, i as i32),
+                            CellData::from_str(entry).unwrap(),
+                        );
                     }
                 }
             }
         } else {
             println!("File could not be read");
         }
-    } else {
-        println!("No file given as input");
     }
+    fn load_linked_files(filen: &'static str, data: &mut Sheet) -> HashSet<&'static str> {
+        let mut files = data.get_files();
+        files.insert(filen);
+        let mut ref_files = data.get_linked_files();
+        while ref_files.difference(&files).count() != 0 {
+            println!("{files:?} {ref_files:?}");
+            let mut to_ins = vec![];
+            for file in ref_files.difference(&files) {
+                load_file(file, data);
+                to_ins.push(*file);
+            }
+            for file in to_ins {
+                files.insert(file);
+            }
+            ref_files = data.get_linked_files();
+        }
+        files
+    }
+    let (mut shown_file, mut files): (&'static str, Vec<(&'static str, u32)>) =
+        if let Some(filen) = file {
+            let filen: &'static str = filen.to_string_lossy().into_owned().leak();
+            load_file(filen, &mut data);
+            let files = load_linked_files(filen, &mut data);
+            (filen, files.into_iter().map(|x| (x, 0)).collect())
+        } else {
+            println!("No file given as input");
+            let filen = "new_file.gg";
+            (filen, vec![(filen, 0)])
+        };
 
     let mut framecount = 0;
     // when i do caching dont do this
@@ -459,20 +525,56 @@ fn main() {
                     y,
                 } => {
                     println!("{} {}", x / cellw, (y - top) / cellh);
-                    let new = (
-                        ((x + scroll.0) / cellw - 1),
+                    let new = SLoc(
+                        shown_file,
+                        (x + scroll.0) / cellw - 1,
                         ((y + scroll.1) - top) / cellh - 1,
                     );
                     if y < top {
                         // TODO menu and clicking into formula
                         Dirty::No
+                    } else if y > height - tab_bottom {
+                        if x > width - tab_bottom {
+                            let new_file = rfd::FileDialog::new()
+                                .set_title("Choose a .gg file")
+                                .add_filter("Gogebia", &["gg"])
+                                .set_directory(std::env::current_dir().unwrap())
+                                .pick_file();
+
+                            if let Some(new_file) = new_file.and_then(|p| {
+                                if p.parent() == std::env::current_dir().ok().as_deref() {
+                                    p.file_name()?.to_str()
+                                } else {
+                                    p.to_str()
+                                }
+                                .map(|x| x.to_owned())
+                            }) {
+                                let new_file = new_file.leak();
+                                load_file(new_file, &mut data);
+                                files = load_linked_files(new_file, &mut data)
+                                    .into_iter()
+                                    .map(|x| (x, 0))
+                                    .collect();
+                                Dirty::Recompute
+                            } else {
+                                Dirty::No
+                            }
+                        } else {
+                            let x_clicked = files
+                                .iter()
+                                .position(|(_, w)| w > &(x as u32))
+                                .unwrap_or(files.len());
+                            println!("clicked tab {x_clicked:?}");
+                            shown_file = files[x_clicked - 1].0;
+                            Dirty::Visual
+                        }
                     } else if let Some(cur) = cursor {
                         if let Some(s) = selected {
                             form_select_start = Some(new);
                             form_select_done = false;
                             form_select_end = None;
 
-                            let show = show_ref(&new);
+                            let show = show_ref_local(&new);
                             form_select_cursor = Some(cur..cur + show.len());
                             cursor = Some(cur + show.len());
                             // dbg!(&show);
@@ -489,7 +591,7 @@ fn main() {
                         let t = if selected == Some(new) {
                             println!("1");
                             Dirty::No
-                        } else if new.0 >= 0 && new.1 >= 0 {
+                        } else if new.1 >= 0 && new.2 >= 0 {
                             println!("2");
                             selected = Some(new);
                             Dirty::Visual
@@ -531,8 +633,9 @@ fn main() {
                     xrel: _,
                     yrel: _,
                 } => {
-                    let curc = (
-                        ((x + scroll.0) / cellw - 1),
+                    let curc = SLoc(
+                        shown_file,
+                        (x + scroll.0) / cellw - 1,
                         ((y + scroll.1) - top) / cellh - 1,
                     );
                     if y < top {
@@ -545,8 +648,8 @@ fn main() {
                             println!("{curc:?}");
                             form_select_end = Some(curc);
 
-                            let shows = show_ref(&start);
-                            let showe = show_ref(&curc);
+                            let shows = show_ref_local(&start);
+                            let showe = show_ref_local(&curc);
                             println!("{}:{}", shows, showe);
                             if let Some(v) = data.val_mut(&s) {
                                 match curc.cmp(&start) {
@@ -592,10 +695,10 @@ fn main() {
                     //     shifted = false;
                     // }
                     if let Some(key) = keycode {
-                        if let Some((x, y)) = selected {
+                        if let Some(SLoc(f, x, y)) = selected {
                             if key == Keycode::Backspace {
                                 if let Some(cur) = cursor {
-                                    if let Ok(dmut) = data.get_mut(&(x, y)) {
+                                    if let Ok(dmut) = data.get_mut(&SLoc(f, x, y)) {
                                         let dp = dmut.val.len();
                                         if cur > 0 && cur <= dp {
                                             dmut.val.remove(cur - 1);
@@ -611,31 +714,32 @@ fn main() {
                                         Dirty::No
                                     }
                                 } else {
-                                    data.dirty(&(x, y));
-                                    data.remove(&(x, y));
+                                    data.dirty(&SLoc(f, x, y));
+                                    data.remove(&SLoc(f, x, y));
                                     Dirty::Recompute
                                 }
                                 // dbg!(&data.get(&(x, y)).unwrap());
                             } else if key == Keycode::Return {
                                 if cursor.is_some() {
-                                    data.dirty(&(x, y));
-                                    selected = Some((x, y + 1));
+                                    data.dirty(&SLoc(f, x, y));
+                                    selected = Some(SLoc(f, x, y + 1));
                                     cursor = None;
                                 } else {
                                     cursor = Some(0);
                                 }
                                 Dirty::Recompute
                             } else if key == Keycode::Down {
-                                selected = Some((x, y + 1));
+                                selected = Some(SLoc(f, x, y + 1));
                                 let r = if cursor.is_some() {
-                                    data.dirty(&(x, y));
+                                    data.dirty(&SLoc(f, x, y));
                                     cursor = None;
                                     Dirty::Recompute
                                 } else {
                                     Dirty::Visual
                                 };
-                                if (y + 3) * cellh >= height - top + scroll.1 {
-                                    scroll.1 = (y + 3 - (height - top) / cellh) * cellh;
+                                if (y + 3) * cellh >= height - top + scroll.1 - tab_bottom {
+                                    scroll.1 =
+                                        (y + 3 - (height - top - tab_bottom) / cellh) * cellh;
                                     Dirty::Recompute
                                 } else {
                                     r
@@ -652,7 +756,7 @@ fn main() {
                                         Dirty::Visual
                                     }
                                 } else {
-                                    selected = Some(((x - 1).max(0), y));
+                                    selected = Some(SLoc(f, (x - 1).max(0), y));
                                     if (x - 1) * cellw < scroll.0 {
                                         scroll.0 = (x - 1).max(0) * cellw;
                                         Dirty::Recompute
@@ -664,7 +768,7 @@ fn main() {
                                 if let Some(cpos) = cursor {
                                     if cpos
                                         == data
-                                            .get(&(x, y))
+                                            .get(&SLoc(f, x, y))
                                             .map(|x| &x.val as &str)
                                             .unwrap_or("")
                                             .len()
@@ -678,7 +782,7 @@ fn main() {
                                         Dirty::Visual
                                     }
                                 } else {
-                                    selected = Some((x + 1, y));
+                                    selected = Some(SLoc(f, x + 1, y));
                                     if (x + 3) * cellw > width + scroll.0 {
                                         scroll.0 = (x + 3 - width / cellw) * cellw;
                                         Dirty::Recompute
@@ -687,7 +791,7 @@ fn main() {
                                     }
                                 }
                             } else if key == Keycode::Up {
-                                selected = Some((x, (y - 1).max(0)));
+                                selected = Some(SLoc(f, x, (y - 1).max(0)));
                                 cursor = None;
                                 if (y - 1) * cellh < scroll.1 {
                                     scroll.1 = (y - 1).max(0) * cellh;
@@ -698,7 +802,7 @@ fn main() {
                             } else if key == Keycode::Escape {
                                 if cursor.is_some() {
                                     if let Some(fc) = form_select_cursor.clone() {
-                                        if let Some(v) = data.val_mut(&(x, y)) {
+                                        if let Some(v) = data.val_mut(&SLoc(f, x, y)) {
                                             v.replace_range(fc, "");
                                             form_select_cursor = None;
                                             form_select_start = None;
@@ -709,9 +813,9 @@ fn main() {
                                         let p = prev_val;
                                         prev_val = None;
                                         if let Some(prev) = p {
-                                            data.set_val(&(x, y), prev);
+                                            data.set_val(&SLoc(f, x, y), prev);
                                         } else {
-                                            data.set_val(&(x, y), "".into());
+                                            data.set_val(&SLoc(f, x, y), "".into());
                                         }
                                     }
                                 } else {
@@ -724,12 +828,12 @@ fn main() {
                                         if let Some(fe) = form_select_end {
                                             let newr = format!(
                                                 "range(.C{:+},.R{:+},.C{:+},.R{:+})",
-                                                fs.0 - x,
-                                                fs.1 - y,
-                                                fe.0 - x,
-                                                fe.1 - y
+                                                fs.1 - x,
+                                                fs.2 - y,
+                                                fe.1 - x,
+                                                fe.2 - y
                                             );
-                                            if let Some(v) = data.val_mut(&(x, y)) {
+                                            if let Some(v) = data.val_mut(&SLoc(f, x, y)) {
                                                 v.replace_range(fr.clone(), &newr);
                                                 form_select_done = true;
                                                 form_select_cursor = None;
@@ -741,11 +845,12 @@ fn main() {
                                             }
                                         } else {
                                             let newr = format!(
-                                                "value(.C{:+},.R{:+})",
-                                                fs.0 - x,
-                                                fs.1 - y,
+                                                "value('{}',.C{:+},.R{:+})",
+                                                fs.0,
+                                                fs.1 - x,
+                                                fs.2 - y,
                                             );
-                                            if let Some(v) = data.val_mut(&(x, y)) {
+                                            if let Some(v) = data.val_mut(&SLoc(f, x, y)) {
                                                 v.replace_range(fr.clone(), &newr);
                                                 form_select_done = true;
                                                 form_select_cursor = None;
@@ -779,24 +884,22 @@ fn main() {
                     window_id: _,
                     text,
                 } => {
-                    if let Some((x, y)) = selected {
-                        if !data.contains_key(&(x, y)) {
-                            assert!(data
-                                .insert((x, y), CellData::from_str("").unwrap())
-                                .is_none());
+                    if let Some(sloc) = selected {
+                        if !data.contains_key(&sloc) {
+                            assert!(data.insert(sloc, CellData::from_str("").unwrap()).is_none());
                         }
                         // data.get_mut(&(x, y)).unwrap().push_str(&text);
                         if let Some(cpos) = cursor {
-                            dbg!(data.val_mut(&(x, y))).unwrap().insert_str(cpos, &text);
+                            dbg!(data.val_mut(&sloc)).unwrap().insert_str(cpos, &text);
                             cursor = Some(cpos + text.len());
                             form_select_cursor = None;
                             form_select_start = None;
                             form_select_end = None;
                             Dirty::Visual
                         } else {
-                            prev_val = data.val_mut(&(x, y)).cloned();
+                            prev_val = data.val_mut(&sloc).cloned();
                             cursor = Some(text.len());
-                            data.set_val(&(x, y), text);
+                            data.set_val(&sloc, text);
                             Dirty::Visual
                         }
                     } else {
@@ -843,7 +946,7 @@ fn main() {
             let cell_scroll_x = scroll.0 / cellw;
             let cell_scroll_y = scroll.1 / cellh;
 
-            let h34 = height - top;
+            let cells_height = height - top - tab_bottom;
             canvas.set_draw_color(BLACK);
             canvas
                 .fill_rect(Rect::new(
@@ -865,17 +968,17 @@ fn main() {
             if dirty == Dirty::Recompute {
                 // data.recompute();
                 data.recompute_range(Range(
-                    (cell_scroll_x, cell_scroll_y),
+                    SLoc(shown_file, cell_scroll_x, cell_scroll_y),
                     SLocBound(
                         formula::Bound::Fin(cell_scroll_x + width / cellw),
-                        formula::Bound::Fin(cell_scroll_y + h34 / cellh),
+                        formula::Bound::Fin(cell_scroll_y + cells_height / cellh),
                     ),
                 ));
             }
 
             // Render cells
             for x in 0..=(width / cellw) {
-                for y in 0..=(h34 / cellh) {
+                for y in 0..=(cells_height / cellh) {
                     let (xs, ys) = (x + cell_scroll_x - 1, y + cell_scroll_y - 1);
                     if x == 0 && y == 0 {
                         continue;
@@ -933,8 +1036,8 @@ fn main() {
                         continue;
                     } else {
                         // render cells that are not being typed in
-                        if Some((xs, ys)) != selected || cursor.is_none() {
-                            let Some(s) = data.get_display(&(xs, ys)) else {
+                        if Some(SLoc(shown_file, xs, ys)) != selected || cursor.is_none() {
+                            let Some(s) = data.get_display(&SLoc(shown_file, xs, ys)) else {
                                 continue;
                             };
                             // let Ok(text) = cellfont.render(s.display.as_ref().unwrap()).solid(BLACK)
@@ -988,7 +1091,7 @@ fn main() {
                 }
             }
 
-            for i in 2..=(h34 / cellh) {
+            for i in 2..=(cells_height / cellh) {
                 // horizontal lines
                 canvas
                     .fill_rect(Rect::new(
@@ -1004,7 +1107,7 @@ fn main() {
                     cellw - border / 2,
                     top,
                     border.try_into().unwrap(),
-                    h34.try_into().unwrap(),
+                    cells_height.try_into().unwrap(),
                 ))
                 .unwrap();
             for i in 2..=(width / cellw) {
@@ -1014,15 +1117,15 @@ fn main() {
                         (i + cell_scroll_x) * cellw - scroll.0 - border / 2,
                         top,
                         border.try_into().unwrap(),
-                        h34.try_into().unwrap(),
+                        cells_height.try_into().unwrap(),
                     ))
                     .unwrap();
             }
 
-            if let Some((x, y)) = selected {
+            if let Some(sloc) = selected {
                 // if let Some(s) = data.get_display(&(x, y)) {
                 // Render edit box text
-                if let Ok(sd) = data.get(&(x, y)) {
+                if let Ok(sd) = data.get(&sloc) {
                     match mainfont.render(&sd.val).solid(BLACK) {
                         Ok(text) => {
                             let text_text = texturer.create_texture_from_surface(text).unwrap();
@@ -1047,7 +1150,7 @@ fn main() {
                 }
 
                 // Cell box render
-                let text_res = if let Ok(sd) = data.get(&(x, y)) {
+                let text_res = if let Ok(sd) = data.get(&sloc) {
                     if cursor.is_some() {
                         cellfont.render(&sd.val).solid(BLACK).ok()
                     } else if let Some(d) = &sd.display {
@@ -1066,10 +1169,10 @@ fn main() {
                         let sm = text_text.query();
                         select_box(
                             &mut canvas,
-                            x,
+                            sloc.1,
                             cellw,
                             border,
-                            y,
+                            sloc.2,
                             cellh,
                             top,
                             sm.width.checked_sub(cellw as u32).map(|x| x + 4),
@@ -1080,8 +1183,8 @@ fn main() {
                                 &text_text,
                                 None,
                                 Some(Rect::new(
-                                    (x + 1) * cellw - scroll.0 + border / 2,
-                                    (y + 1) * cellh - scroll.1 + border / 2 + top,
+                                    (sloc.1 + 1) * cellw - scroll.0 + border / 2,
+                                    (sloc.2 + 1) * cellh - scroll.1 + border / 2 + top,
                                     sm.width,
                                     cellh.try_into().unwrap(),
                                 )),
@@ -1089,7 +1192,17 @@ fn main() {
                             .unwrap();
                     }
                     None => {
-                        select_box(&mut canvas, x, cellw, border, y, cellh, top, None, scroll);
+                        select_box(
+                            &mut canvas,
+                            sloc.1,
+                            cellw,
+                            border,
+                            sloc.2,
+                            cellh,
+                            top,
+                            None,
+                            scroll,
+                        );
                     }
                 }
                 // } else {
@@ -1119,13 +1232,41 @@ fn main() {
                         .unwrap();
                 }
             }
+
+            // Draw bottom bar
+            let mut index: u32 = 0;
+            for file in files.iter_mut() {
+                let text_res = tabfont.render(file.0).solid(BLACK).ok();
+                match text_res {
+                    Some(text) => {
+                        let text_text = texturer.create_texture_from_surface(text).unwrap();
+                        file.1 = index;
+                        let sm = text_text.query();
+                        canvas
+                            .copy(
+                                &text_text,
+                                None,
+                                Some(Rect::new(
+                                    index as i32,
+                                    height - tab_bottom,
+                                    (width as u32).min(sm.width),
+                                    (tab_bottom as u32).min(sm.height),
+                                )),
+                            )
+                            .unwrap();
+                        index += sm.width + 20;
+                    }
+                    None => {}
+                }
+            }
+
             println!("Drew");
 
             canvas.present();
         }
         std::thread::sleep(Duration::from_millis(33));
     }
-    if let Some(filen) = std::env::args().nth(1) {
+    for filen in data.get_files() {
         if let Ok(file_zipped) = std::fs::File::create(filen) {
             let filer = flate2::write::GzEncoder::new(file_zipped, Compression::best());
             let mut file = csv::WriterBuilder::new()
@@ -1134,11 +1275,11 @@ fn main() {
 
             let (max_x, max_y) = data
                 .keys()
-                .fold((0, 0), |x, y| (x.0.max(y.0), x.1.max(y.1)));
+                .fold((0, 0), |x, y| (x.0.max(y.1), x.1.max(y.2)));
             for i in 0..=max_y {
                 let mut rec: Vec<&str> = vec![];
                 for j in 0..=max_x {
-                    if let Ok(v) = data.get(&(j, i)) {
+                    if let Ok(v) = data.get(&SLoc(filen, j, i)) {
                         rec.push(&v.val);
                     } else {
                         rec.push("");
@@ -1149,8 +1290,6 @@ fn main() {
         } else {
             println!("Could not write to file");
         }
-    } else {
-        println!("No file given as input");
     }
 }
 
