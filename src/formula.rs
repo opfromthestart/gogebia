@@ -314,7 +314,7 @@ impl Range {
         Self(cell, SLocBound(Bound::Inf, Bound::Inf))
     }
     fn in_range(&self, cell: &SLoc) -> bool {
-        if self.0 .0 != cell.0 || cell.1 < self.0 .1 || cell.2 < self.0 .2 {
+        if cell.1 < self.0 .1 || cell.2 < self.0 .2 || self.0 .0 != cell.0 {
             false
         } else {
             self.1 .0.ge(cell.1) && self.1 .1.ge(cell.2)
@@ -854,11 +854,70 @@ fn form_tokens(formula: &str) -> Vec<(&str, usize)> {
 
 #[derive(Debug, Clone, PartialEq)]
 enum ParenTree<'a> {
-    Paren(Vec<ParenTree<'a>>),
+    Paren(Cow<'a, [ParenTree<'a>]>),
     Token(&'a str, usize),
 }
 
+// enum ParenTreeIter<'a, 'b> {
+//     Cow(std::slice::Iter<'b, ParenTree<'a>>),
+//     Array(std::array::IntoIter<&'b ParenTree<'a>, 1>),
+// }
+
+// impl<'a, 'b> Iterator for ParenTreeIter<'a, 'b> {
+//     type Item = &'b ParenTree<'a>;
+
+//     fn next(&mut self) -> Option<Self::Item> {
+//         match self {
+//             ParenTreeIter::Cow(c) => c.next(),
+//             ParenTreeIter::Array(a) => a.next(),
+//         }
+//     }
+// }
+
+enum ParenTreeIterSplit<'a, 'b, F: Fn(&ParenTree<'a>) -> bool> {
+    Cow(&'b [ParenTree<'a>], usize, F),
+    Array([ParenTree<'a>; 1], bool),
+}
+
+impl<'a, 'b, F: Fn(&ParenTree<'a>) -> bool> Iterator for ParenTreeIterSplit<'a, 'b, F> {
+    type Item = Cow<'b, [ParenTree<'a>]>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            ParenTreeIterSplit::Cow(c, i, split) => {
+                let start = *i;
+                let leng = c[start..].iter().position(split);
+                if let Some(leng) = leng {
+                    let end = start + leng;
+                    *i = end + 1;
+                    Some(Cow::Borrowed(&c[start..end]))
+                } else if start != c.len() {
+                    *i = c.len();
+                    Some(Cow::Borrowed(&c[start..]))
+                } else {
+                    None
+                }
+            }
+            ParenTreeIterSplit::Array(a, d) => {
+                if !*d {
+                    *d = true;
+                    Some(Cow::Owned(a.to_vec()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 impl<'a> ParenTree<'a> {
+    fn downgrade<'b>(&'b self) -> &'b ParenTree<'b>
+    where
+        'a: 'b,
+    {
+        // Safety: This must work since if a reference is valid for 'a, it is valid for at least 'b
+        unsafe { std::mem::transmute(self) }
+    }
     fn len(&self) -> usize {
         match self {
             ParenTree::Paren(p) => p.iter().map(|p| p.len()).sum(),
@@ -899,11 +958,19 @@ impl<'a> ParenTree<'a> {
             ParenTree::Token(_, _) => vec![self.clone()].into_iter(),
         }
     }
-    fn iter(&self) -> impl Iterator<Item = ParenTree<'a>> {
+    // fn iter<'b>(&'b self) -> ParenTreeIter<'a, 'b> {
+    //     match self {
+    //         ParenTree::Paren(p) => ParenTreeIter::Cow(p.iter()),
+    //         ParenTree::Token(_, _) => ParenTreeIter::Array([self].into_iter()),
+    //     }
+    // }
+    fn split<'b, F: Fn(&ParenTree<'a>) -> bool>(
+        &'b self,
+        split: F,
+    ) -> ParenTreeIterSplit<'a, 'b, F> {
         match self {
-            #[allow(clippy::unnecessary_to_owned)]
-            ParenTree::Paren(p) => p.to_vec().into_iter(),
-            ParenTree::Token(_, _) => vec![self.clone()].into_iter(),
+            ParenTree::Paren(p) => ParenTreeIterSplit::Cow(&p, 0, split),
+            ParenTree::Token(_, _) => ParenTreeIterSplit::Array([self.clone()], false),
         }
     }
     fn as_op(&self) -> Option<char> {
@@ -1005,14 +1072,16 @@ fn split_parens<'a>(tokens: &[(&'a str, usize)]) -> Result<ParenTree<'a>, Value>
                 .into(),
             ))
         } else {
-            Ok(ParenTree::Paren(split_par_vec))
+            Ok(ParenTree::Paren(Cow::Owned(split_par_vec)))
         }
     }
 }
 
 // TODO functions with no arguments
 // TODO parse ranges of cells
-fn form_tree(split_par: &ParenTree<'_>, in_sheet: &'static str) -> (Value, bool) {
+fn form_tree<'c, 'b>(split_par: &'b ParenTree<'c>, in_sheet: &'static str) -> (Value, bool)
+where
+{
     if split_par.len() == 0 {
         return (
             Value::Const(
@@ -1051,383 +1120,392 @@ fn form_tree(split_par: &ParenTree<'_>, in_sheet: &'static str) -> (Value, bool)
             )
         };
     }
-    let ParenTree::Paren(split_v) = &split_par else {
-        panic!("Other case already checked");
-    };
-    // dbg!(&split_v);
-    enum Category {
-        Value,
-        Operand,
-        Function,
-    }
-
-    let cats = split_v.iter().map(|s| {
-        if s.is_func() {
-            Category::Function
-        } else if s.is_op() {
-            Category::Operand
-        } else {
-            Category::Value
+    match split_par.downgrade::<'b>() {
+        ParenTree::Token(_, _) => {
+            panic!("Other case already checked");
         }
-    });
-    #[derive(Clone, Debug)]
-    enum CatParsed<'a> {
-        Value((Value, bool)),
-        Args(Vec<Value>),
-        Operand(char),
-        Function(&'a str),
-    }
-
-    let mut parseds = split_v
-        .iter()
-        .zip(cats)
-        .map(|(v, c)| match c {
-            Category::Value => {
-                // dbg!(&v);
-                if v.is_mul_args() {
-                    // TODO dont do whatever it is here, need to fix split_parens
-                    let vargs: Vec<_> = v.iter().collect();
-                    // dbg!(&vargs);
-
-                    CatParsed::Args(
-                        vargs
-                            .split(|varg| varg.is_comma())
-                            .map(|varg| (form_tree(&ParenTree::Paren((varg).to_vec()), in_sheet)).0)
-                            .collect(),
-                    )
-                } else {
-                    // println!("As val");
-                    CatParsed::Value(form_tree(v, in_sheet))
-                }
+        ParenTree::Paren(split_v) => {
+            // dbg!(&split_v);
+            enum Category {
+                Value,
+                Operand,
+                Function,
             }
-            Category::Operand => CatParsed::Operand(v.as_op().unwrap()),
-            Category::Function => CatParsed::Function(v.as_func().unwrap()),
-        })
-        .peekable();
 
-    // let p2 = parseds.clone();
-    // println!("Parseds:");
-    // for e in p2 {
-    //     dbg!(e);
-    // }
-    // println!("Parsed End");
-    // dbg!(&parseds);
+            let cats = split_v.iter().map(|s| {
+                if s.is_func() {
+                    Category::Function
+                } else if s.is_op() {
+                    Category::Operand
+                } else {
+                    Category::Value
+                }
+            });
+            #[derive(Clone, Debug)]
+            enum CatParsed<'a> {
+                Value((Value, bool)),
+                Args(Vec<Value>),
+                Operand(char),
+                Function(&'a str),
+            }
 
-    // Resolve function calls
-    let mut token_orchard = vec![];
-    let mut i = 0;
-    while parseds.peek().is_some() {
-        // let e = dbg!(parseds.next().expect("Had to be some"));
-        let e = parseds.next().expect("Had to be some");
-        if let CatParsed::Function(name) = e {
-            let lp = split_par.get(i).unwrap();
-            let Some(args) = parseds.next() else {
-                return (
-                    Value::Const(
-                        ConstType::Error(CellError::InvalidFormula {
-                            cell: None,
-                            cursor: lp.1,
-                            reason: "Function has no arguments",
-                        })
-                        .into(),
-                    ),
-                    false,
-                );
-            };
-            // dbg!(&args);
-            i += 1;
-            let args = match args {
-                CatParsed::Value(v) => vec![v.0],
-                CatParsed::Args(a) => a,
-                CatParsed::Operand(_) | CatParsed::Function(_) => {
+            let mut parseds = split_v
+                .iter()
+                .zip(cats)
+                .map(|(v, c)| match c {
+                    Category::Value => {
+                        // dbg!(&v);
+                        if v.is_mul_args() {
+                            // TODO dont do whatever it is here, need to fix split_parens
+                            let c = CatParsed::Args({
+                                // dbg!(&vargs);
+
+                                let c: Vec<_> = v
+                                    .split(|varg| varg.is_comma())
+                                    .map(|varg| {
+                                        let x = ParenTree::Paren(varg);
+                                        let (v, _) = form_tree(&x, in_sheet);
+                                        v
+                                    })
+                                    .collect();
+                                c
+                            });
+                            c
+                        } else {
+                            // println!("As val");
+                            CatParsed::Value(form_tree(v, in_sheet))
+                        }
+                    }
+                    Category::Operand => CatParsed::Operand(v.as_op().unwrap()),
+                    Category::Function => CatParsed::Function(v.as_func().unwrap()),
+                })
+                .peekable();
+
+            // let p2 = parseds.clone();
+            // println!("Parseds:");
+            // for e in p2 {
+            //     dbg!(e);
+            // }
+            // println!("Parsed End");
+            // dbg!(&parseds);
+
+            // Resolve function calls
+            let mut token_orchard = vec![];
+            let mut i = 0;
+            while parseds.peek().is_some() {
+                // let e = dbg!(parseds.next().expect("Had to be some"));
+                let e = parseds.next().expect("Had to be some");
+                if let CatParsed::Function(name) = e {
+                    let lp = split_par.get(i).unwrap();
+                    let Some(args) = parseds.next() else {
+                        return (
+                            Value::Const(
+                                ConstType::Error(CellError::InvalidFormula {
+                                    cell: None,
+                                    cursor: lp.1,
+                                    reason: "Function has no arguments",
+                                })
+                                .into(),
+                            ),
+                            false,
+                        );
+                    };
+                    // dbg!(&args);
+                    i += 1;
+                    let args = match args {
+                        CatParsed::Value(v) => vec![v.0],
+                        CatParsed::Args(a) => a,
+                        CatParsed::Operand(_) | CatParsed::Function(_) => {
+                            return (
+                                Value::Const(
+                                    ConstType::Error(CellError::InvalidFormula {
+                                        cell: None,
+                                        cursor: lp.1,
+                                        reason: "Invalid function arguments",
+                                    })
+                                    .into(),
+                                ),
+                                false,
+                            )
+                        }
+                    };
+                    token_orchard.push((
+                        CatParsed::Value((
+                            Value::Func {
+                                name: name.to_lowercase(),
+                                args,
+                            },
+                            false,
+                        )),
+                        lp.1,
+                    ));
+                } else if let CatParsed::Args(_) = e {
+                    let lp = split_par.get(i).unwrap();
                     return (
                         Value::Const(
                             ConstType::Error(CellError::InvalidFormula {
                                 cell: None,
                                 cursor: lp.1,
-                                reason: "Invalid function arguments",
+                                reason: "Arguments with no function",
                             })
                             .into(),
                         ),
                         false,
-                    )
+                    );
+                } else {
+                    token_orchard.push((e, split_par.get(i).unwrap().1));
                 }
-            };
-            token_orchard.push((
-                CatParsed::Value((
-                    Value::Func {
-                        name: name.to_lowercase(),
-                        args,
-                    },
-                    false,
-                )),
-                lp.1,
-            ));
-        } else if let CatParsed::Args(_) = e {
-            let lp = split_par.get(i).unwrap();
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: lp.1,
-                        reason: "Arguments with no function",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        } else {
-            token_orchard.push((e, split_par.get(i).unwrap().1));
-        }
-        i += 1;
-    }
-    // Parse functions
-    for (i, e) in token_orchard.iter().enumerate() {
-        if i % 2 == 0 {
-            // assert!(matches!(e, CatParsed::Value(_)))
-            if matches!(e.0, CatParsed::Operand(_)) {
+                i += 1;
+            }
+            // Parse functions
+            for (i, e) in token_orchard.iter().enumerate() {
+                if i % 2 == 0 {
+                    // assert!(matches!(e, CatParsed::Value(_)))
+                    if matches!(e.0, CatParsed::Operand(_)) {
+                        return (
+                            Value::Const(
+                                ConstType::Error(CellError::InvalidFormula {
+                                    cell: None,
+                                    cursor: e.1,
+                                    reason: "Found operand where value was expected",
+                                })
+                                .into(),
+                            ),
+                            false,
+                        );
+                    }
+                } else if matches!(e.0, CatParsed::Value(_)) {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: e.1,
+                                reason: "Found value where operand was expected",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                }
+            }
+
+            fn has_mul(vals: &[(CatParsed, usize)]) -> Option<usize> {
+                vals.iter()
+                    .position(|(x, _)| matches!(x, CatParsed::Operand('*' | '/')))
+            }
+            // Parse mul and div
+            while let Some(p) = has_mul(&token_orchard) {
+                let inpos = p - 1;
+                let lhs = token_orchard.remove(p - 1);
+                let (CatParsed::Value(lhs), i) = lhs else {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: lhs.1,
+                                reason: "Left side of mul/div was not value",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                };
+                if token_orchard.len() <= p {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: 0,
+                                reason: "Right side of mul/div not found",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                }
+                let rhs = token_orchard.remove(p);
+                let CatParsed::Value(rhs) = rhs.0 else {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: rhs.1,
+                                reason: "Right side of mul/div was not value",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                };
+                if matches!(token_orchard[inpos].0, CatParsed::Operand('*')) {
+                    token_orchard[inpos] = (
+                        CatParsed::Value((Value::Mul(lhs.0.into(), rhs.0.into()), false)),
+                        i,
+                    );
+                } else {
+                    token_orchard[inpos] = (
+                        CatParsed::Value((Value::Div(lhs.0.into(), rhs.0.into()), false)),
+                        i,
+                    );
+                }
+            }
+
+            fn has_add(vals: &[(CatParsed, usize)]) -> Option<usize> {
+                vals.iter()
+                    .position(|(x, _)| matches!(x, CatParsed::Operand('+' | '-')))
+            }
+            // Parse + and -
+            while let Some(p) = has_add(&token_orchard) {
+                let inpos = p - 1;
+                let lhs = token_orchard.remove(p - 1);
+                let (CatParsed::Value(lhs), i) = lhs else {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: lhs.1,
+                                reason: "Left side of add/sub was not value",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                };
+                if token_orchard.len() <= p {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: 0,
+                                reason: "Right side of add/sub not found",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                }
+                let rhs = token_orchard.remove(p);
+                let CatParsed::Value(rhs) = rhs.0 else {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: rhs.1,
+                                reason: "Right side of add/sub was not value",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                };
+                if matches!(token_orchard[inpos].0, CatParsed::Operand('+')) {
+                    token_orchard[inpos] = (
+                        CatParsed::Value((Value::Add(lhs.0.into(), rhs.0.into()), false)),
+                        i,
+                    );
+                } else {
+                    token_orchard[inpos] = (
+                        CatParsed::Value((Value::Sub(lhs.0.into(), rhs.0.into()), false)),
+                        i,
+                    );
+                }
+            }
+
+            fn has_comp(vals: &[(CatParsed, usize)]) -> Option<usize> {
+                vals.iter()
+                    .position(|(x, _)| matches!(x, CatParsed::Operand('<' | '=' | '>')))
+            }
+            // Parse < and =
+            while let Some(p) = has_comp(&token_orchard) {
+                // let p = 1;
+                let inpos = p - 1;
+                let lhs = token_orchard.remove(p - 1);
+                let (CatParsed::Value(lhs), i) = lhs else {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: lhs.1,
+                                reason: "Left side of equality/inequality was not value",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                };
+                if token_orchard.len() <= p {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: 0,
+                                reason: "Right side of equality/inequality not found",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                }
+                let rhs = token_orchard.remove(p);
+                let CatParsed::Value(rhs) = rhs.0 else {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: rhs.1,
+                                reason: "Right side of equality/inequality was not value",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                };
+                if matches!(token_orchard[inpos].0, CatParsed::Operand('<')) {
+                    token_orchard[inpos] = (
+                        CatParsed::Value((Value::Lt(lhs.0.into(), rhs.0.into()), false)),
+                        i,
+                    );
+                } else if matches!(token_orchard[inpos].0, CatParsed::Operand('=')) {
+                    token_orchard[inpos] = (
+                        CatParsed::Value((Value::Eq(lhs.0.into(), rhs.0.into()), false)),
+                        i,
+                    );
+                } else if matches!(token_orchard[inpos].0, CatParsed::Operand('>')) {
+                    token_orchard[inpos] = (
+                        CatParsed::Value((Value::Gt(lhs.0.into(), rhs.0.into()), false)),
+                        i,
+                    );
+                } else {
+                    return (
+                        Value::Const(
+                            ConstType::Error(CellError::InvalidFormula {
+                                cell: None,
+                                cursor: token_orchard[inpos].1,
+                                reason: "Operand is not supported",
+                            })
+                            .into(),
+                        ),
+                        false,
+                    );
+                }
+            }
+
+            let (CatParsed::Value((ret, _)), _) = token_orchard[0].clone() else {
                 return (
                     Value::Const(
                         ConstType::Error(CellError::InvalidFormula {
                             cell: None,
-                            cursor: e.1,
-                            reason: "Found operand where value was expected",
+                            cursor: token_orchard[0].1,
+                            reason: "Something weird happened idk",
                         })
                         .into(),
                     ),
                     false,
                 );
-            }
-        } else if matches!(e.0, CatParsed::Value(_)) {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: e.1,
-                        reason: "Found value where operand was expected",
-                    })
-                    .into(),
-                ),
-                false,
-            );
+            };
+            (ret, false)
         }
     }
-
-    fn has_mul(vals: &[(CatParsed, usize)]) -> Option<usize> {
-        vals.iter()
-            .position(|(x, _)| matches!(x, CatParsed::Operand('*' | '/')))
-    }
-    // Parse mul and div
-    while let Some(p) = has_mul(&token_orchard) {
-        let inpos = p - 1;
-        let lhs = token_orchard.remove(p - 1);
-        let (CatParsed::Value(lhs), i) = lhs else {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: lhs.1,
-                        reason: "Left side of mul/div was not value",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        };
-        if token_orchard.len() <= p {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: 0,
-                        reason: "Right side of mul/div not found",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        }
-        let rhs = token_orchard.remove(p);
-        let CatParsed::Value(rhs) = rhs.0 else {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: rhs.1,
-                        reason: "Right side of mul/div was not value",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        };
-        if matches!(token_orchard[inpos].0, CatParsed::Operand('*')) {
-            token_orchard[inpos] = (
-                CatParsed::Value((Value::Mul(lhs.0.into(), rhs.0.into()), false)),
-                i,
-            );
-        } else {
-            token_orchard[inpos] = (
-                CatParsed::Value((Value::Div(lhs.0.into(), rhs.0.into()), false)),
-                i,
-            );
-        }
-    }
-
-    fn has_add(vals: &[(CatParsed, usize)]) -> Option<usize> {
-        vals.iter()
-            .position(|(x, _)| matches!(x, CatParsed::Operand('+' | '-')))
-    }
-    // Parse + and -
-    while let Some(p) = has_add(&token_orchard) {
-        let inpos = p - 1;
-        let lhs = token_orchard.remove(p - 1);
-        let (CatParsed::Value(lhs), i) = lhs else {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: lhs.1,
-                        reason: "Left side of add/sub was not value",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        };
-        if token_orchard.len() <= p {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: 0,
-                        reason: "Right side of add/sub not found",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        }
-        let rhs = token_orchard.remove(p);
-        let CatParsed::Value(rhs) = rhs.0 else {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: rhs.1,
-                        reason: "Right side of add/sub was not value",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        };
-        if matches!(token_orchard[inpos].0, CatParsed::Operand('+')) {
-            token_orchard[inpos] = (
-                CatParsed::Value((Value::Add(lhs.0.into(), rhs.0.into()), false)),
-                i,
-            );
-        } else {
-            token_orchard[inpos] = (
-                CatParsed::Value((Value::Sub(lhs.0.into(), rhs.0.into()), false)),
-                i,
-            );
-        }
-    }
-
-    fn has_comp(vals: &[(CatParsed, usize)]) -> Option<usize> {
-        vals.iter()
-            .position(|(x, _)| matches!(x, CatParsed::Operand('<' | '=' | '>')))
-    }
-    // Parse < and =
-    while let Some(p) = has_comp(&token_orchard) {
-        // let p = 1;
-        let inpos = p - 1;
-        let lhs = token_orchard.remove(p - 1);
-        let (CatParsed::Value(lhs), i) = lhs else {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: lhs.1,
-                        reason: "Left side of equality/inequality was not value",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        };
-        if token_orchard.len() <= p {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: 0,
-                        reason: "Right side of equality/inequality not found",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        }
-        let rhs = token_orchard.remove(p);
-        let CatParsed::Value(rhs) = rhs.0 else {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: rhs.1,
-                        reason: "Right side of equality/inequality was not value",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        };
-        if matches!(token_orchard[inpos].0, CatParsed::Operand('<')) {
-            token_orchard[inpos] = (
-                CatParsed::Value((Value::Lt(lhs.0.into(), rhs.0.into()), false)),
-                i,
-            );
-        } else if matches!(token_orchard[inpos].0, CatParsed::Operand('=')) {
-            token_orchard[inpos] = (
-                CatParsed::Value((Value::Eq(lhs.0.into(), rhs.0.into()), false)),
-                i,
-            );
-        } else if matches!(token_orchard[inpos].0, CatParsed::Operand('>')) {
-            token_orchard[inpos] = (
-                CatParsed::Value((Value::Gt(lhs.0.into(), rhs.0.into()), false)),
-                i,
-            );
-        } else {
-            return (
-                Value::Const(
-                    ConstType::Error(CellError::InvalidFormula {
-                        cell: None,
-                        cursor: token_orchard[inpos].1,
-                        reason: "Operand is not supported",
-                    })
-                    .into(),
-                ),
-                false,
-            );
-        }
-    }
-
-    let (CatParsed::Value((ret, _)), _) = token_orchard[0].clone() else {
-        return (
-            Value::Const(
-                ConstType::Error(CellError::InvalidFormula {
-                    cell: None,
-                    cursor: token_orchard[0].1,
-                    reason: "Something weird happened idk",
-                })
-                .into(),
-            ),
-            false,
-        );
-    };
-    (ret, false)
 }
 
 fn letters_to_row(token: &str) -> Option<i32> {
@@ -1635,7 +1713,7 @@ impl Value {
     }
 
     /// Whenever the `spec` variable changes in a recursive call, depth should be incremented
-    fn eval<'a>(
+    pub(crate) fn eval<'a>(
         &'a self,
         data: &SheetData,
         eval: &mut SheetEval,
@@ -2122,7 +2200,7 @@ fn is_range_formula(formula: &str, in_sheet: &'static str) -> Result<RangeFormul
     };
     // todo!("Make ] into none");
     let cond = if args.len() > 6 {
-        ParenTree::Paren(args[6..args.len()].to_vec())
+        ParenTree::Paren(Cow::Borrowed(&args[6..args.len()]))
     } else {
         ParenTree::Token("true", 0)
     };
@@ -2314,6 +2392,7 @@ impl Sheet {
         if view_range.is_inf() {
             return;
         }
+        // Cells on the screen that are in a range function
         let mut dummies = HashSet::new();
         for sheetrange in self.ranges.iter() {
             let inter = view_range.intersect(sheetrange);
@@ -2324,7 +2403,7 @@ impl Sheet {
             };
             for cell in riter {
                 if !self.contains_key(&cell) {
-                    println!("{cell:?} ispartof {sheetrange:?}");
+                    // println!("{cell:?} ispartof {sheetrange:?}");
                     dummies.insert((cell, sheetrange.0));
                 }
             }
@@ -2341,26 +2420,29 @@ impl Sheet {
             );
             // self.get_mut(&range_origin).unwrap().dependants.insert(cell);
         }
-        let mut offscreenrange = true;
-        let mut keyc = self.data.0.keys().cloned().collect();
-        while offscreenrange {
-            offscreenrange = false;
-            self.data.0.retain(|sloc, data| {
-                let keep = view_range.in_range(sloc)
-                    || !data.rangeform
-                    || data.dependants.intersection(&keyc).next().is_some();
-                if !keep {
-                    keyc.remove(sloc);
-                    offscreenrange = true;
-                }
-                keep
-            });
-        }
+
+        // Remove any unneeded offscreen elements
+        // I think this is causing more problems than its helping
+        // let mut offscreenrange = true;
+        // let mut keyc = self.data.0.keys().cloned().collect();
+        // while offscreenrange {
+        //     offscreenrange = false;
+        //     self.data.0.retain(|sloc, data| {
+        //         let keep = view_range.in_range(sloc)
+        //             || !data.rangeform
+        //             || data.dependants.intersection(&keyc).next().is_some();
+        //         if !keep {
+        //             keyc.remove(sloc);
+        //             offscreenrange = true;
+        //         }
+        //         keep
+        //     });
+        // }
         self.recompute()
     }
 
     pub(crate) fn recompute(&mut self) {
-        println!("Recompute");
+        // println!("Recompute");
         let mut kc: Vec<_> = self.keys().cloned().collect();
         // dbg!(&self);
         // dbg!(&kc);
@@ -2402,6 +2484,7 @@ impl Sheet {
                 }
             }
         }
+        // println!("Updated deps");
         self.ranges.clear();
         let mut orphan_cells = vec![];
         for pos in kc.iter() {
@@ -2467,6 +2550,7 @@ impl Sheet {
         let kc = kc;
         // dbg!(&self);
         // dbg!(&kc);
+        // println!("Reeval cells");
         loop {
             let recpos = self
                 .iter()
@@ -2692,10 +2776,38 @@ impl Function for If {
             n.eval(data, eval, func, ranges, spec).into_owned()
         }
     }
+
+    fn get_refs(
+        &self,
+        args: &[Value],
+        data: &SheetData,
+        eval: &mut SheetEval,
+        func: &SheetFunc,
+        ranges: &SheetRanges,
+        spec: &SpecValues,
+    ) -> Vec<Range> {
+        let [c, y, n] = args else {
+            return vec![];
+        };
+        let mut def_refs = c.get_refs(data, eval, func, ranges, spec);
+        let cval = c.eval(data, eval, func, ranges, spec);
+        if matches!(cval.as_ref().ct, ConstType::Error(_)) {
+            return def_refs;
+        }
+        let ConstType::Bool(c) = cval.as_ref().ct else {
+            return def_refs;
+        };
+        if c {
+            def_refs.extend(y.get_refs(data, eval, func, ranges, spec));
+        } else {
+            def_refs.extend(n.get_refs(data, eval, func, ranges, spec));
+        }
+        def_refs
+    }
 }
 #[derive(Default)]
-pub(crate) struct Valid;
-impl Function for Valid {
+pub(crate) struct ValidFunc;
+impl Function for ValidFunc {
     fn name(&self) -> &'static str {
         "valid"
     }
@@ -2769,28 +2881,45 @@ impl Function for Valid {
         let r = r as i32;
 
         let rf = data.get(&SLoc(f, c, r), eval);
-        if rf.is_err() {
-            return ConstType::Bool(false).into();
-        }
-        let rf = rf.expect("Already handled err case");
-        if let Some(d) = rf.display.clone() {
-            ConstType::Bool(d.ct.truthy()).into()
-        } else {
-            let val = match Value::from_str(&rf.val, f) {
-                Ok(v) => v,
-                Err(e) => {
-                    return ConstType::Error(CellError::InvalidFormula {
-                        cell: Some(SLoc(f, c, r)),
-                        cursor: 0,
-                        reason: e,
-                    })
-                    .into()
-                }
-            };
-            let new_spec = spec.clone().with_sloc(SLoc(f, c, r));
+        // if rf.is_err() {
+        //     return ConstType::Bool(false).into();
+        // }
+        // let rf = rf.expect("Already handled err case");
+        // if let Some(d) = rf.display.clone() {
+        //     ConstType::Bool(d.ct.truthy()).into()
+        // } else {
+        //     let val = match Value::from_str(&rf.val, f) {
+        //         Ok(v) => v,
+        //         Err(e) => {
+        //             return ConstType::Error(CellError::InvalidFormula {
+        //                 cell: Some(SLoc(f, c, r)),
+        //                 cursor: 0,
+        //                 reason: e,
+        //             })
+        //             .into()
+        //         }
+        //     };
+        //     let new_spec = spec.clone().with_sloc(SLoc(f, c, r));
 
-            val.eval(data, eval, func, ranges, &new_spec).into_owned()
+        //     val.eval(data, eval, func, ranges, &new_spec).into_owned()
+        // }
+        match rf {
+            Ok(rf) => {
+                if let Some(d) = &rf.display {
+                    ConstType::Bool(!d.is_error())
+                } else {
+                    let val = match Value::from_str(&rf.val, f) {
+                        Ok(v) => v,
+                        Err(_) => return ConstType::Bool(false).into(),
+                    };
+                    let new_spec = spec.clone().with_sloc(SLoc(f, c, r));
+
+                    ConstType::Bool(val.eval(data, eval, func, ranges, &new_spec).is_error())
+                }
+            }
+            Err(_) => ConstType::Bool(false),
         }
+        .into()
     }
     fn get_refs(
         &self,
@@ -4451,12 +4580,20 @@ mod test {
     }
     #[test]
     fn ref_inv() {
-        let tests = ["A1", "B3", "AA72", "AAA72", "AAZZ99999"];
+        let tests = [
+            "''A1",
+            "''B3",
+            "''AA72",
+            "''AAA72",
+            "''AAZZ99999",
+            "'test.gg'G1",
+        ];
         let tests2 = [
             SLoc("", 0, 0),
             SLoc("", 1, 3),
             SLoc("", 26, 26),
             SLoc("", 57023, 99384),
+            SLoc("test", 8, 9),
         ];
         for t in tests {
             let forward = is_ref(t, "").unwrap();
@@ -4515,27 +4652,27 @@ mod test {
     fn split_paren_test() {
         assert_eq!(
             split_parens(&form_tokens("sum(sum(1,2),3)")),
-            Ok(ParenTree::Paren(vec![
+            Ok(ParenTree::Paren(Cow::Owned(vec![
                 (ParenTree::Token("sum", 0)),
-                (ParenTree::Paren(vec![
+                (ParenTree::Paren(Cow::Owned(vec![
                     (ParenTree::Token("sum", 4)),
-                    (ParenTree::Paren(vec![
+                    (ParenTree::Paren(Cow::Owned(vec![
                         (ParenTree::Token("1", 8)),
                         (ParenTree::Token(",", 9)),
                         (ParenTree::Token("2", 10))
-                    ])),
+                    ]))),
                     (ParenTree::Token(",", 12)),
                     (ParenTree::Token("3", 13))
-                ]))
-            ]))
+                ])))
+            ])))
         );
         assert_eq!(
             split_parens(&form_tokens("sum(range(1,2,3, 4),3,A5)")),
-            Ok(ParenTree::Paren(vec![
+            Ok(ParenTree::Paren(Cow::Owned(vec![
                 (ParenTree::Token("sum", 0)),
-                (ParenTree::Paren(vec![
+                (ParenTree::Paren(Cow::Owned(vec![
                     (ParenTree::Token("range", 4)),
-                    (ParenTree::Paren(vec![
+                    (ParenTree::Paren(Cow::Owned(vec![
                         (ParenTree::Token("1", 10)),
                         (ParenTree::Token(",", 11)),
                         (ParenTree::Token("2", 12)),
@@ -4543,13 +4680,13 @@ mod test {
                         (ParenTree::Token("3", 14)),
                         (ParenTree::Token(",", 15)),
                         (ParenTree::Token("4", 17))
-                    ])),
+                    ]))),
                     (ParenTree::Token(",", 19)),
                     (ParenTree::Token("3", 20)),
                     (ParenTree::Token(",", 21)),
                     (ParenTree::Token("A5", 22))
-                ]))
-            ]))
+                ])))
+            ])))
         );
         assert_eq!(
             split_parens(&form_tokens("sum(range(1,2,3, 4),3,A5)"))
@@ -5652,7 +5789,7 @@ mod test {
             .insert(
                 SLoc("", 1, 0),
                 CellData::default()
-                    .val("=sum(range(0,0,0,10),value(0,1))".into())
+                    .val("=sum(range(0,0,0,10),value(.T,0,1))".into())
                     .display(None)
                     .deps(HashSet::new())
             )
@@ -5953,7 +6090,7 @@ mod test {
         assert!(sheet
             .insert(
                 SLoc("", 1, 0),
-                CellData::default().val("=value(0,1)".into())
+                CellData::default().val("=value(.T,0,1)".into())
             )
             .is_none());
         sheet.recompute();
@@ -5961,7 +6098,7 @@ mod test {
         assert_eq!(
             d,
             &CellData::default()
-                .val("=value(0,1)".into())
+                .val("=value(.T,0,1)".into())
                 .display(Some(ConstType::Num(3.).into()))
                 .deps(HashSet::new())
         );
@@ -5980,7 +6117,7 @@ mod test {
         assert_eq!(
             d,
             &CellData::default()
-                .val("=value(0,1)".into())
+                .val("=value(.T,0,1)".into())
                 .display(Some(
                     ConstType::Error(CellError::MissingCell {
                         cell: Some(SLoc("", 0, 1))
@@ -5990,14 +6127,17 @@ mod test {
                 .deps(HashSet::new())
         );
 
-        sheet.set_val(&SLoc("", 1, 0), "=value(0,1)+value(0,0)+value(1,1)".into());
+        sheet.set_val(
+            &SLoc("", 1, 0),
+            "=value(.T,0,1)+value(.T,0,0)+value(.T,1,1)".into(),
+        );
         sheet.set_val(&SLoc("", 0, 1), "5".into());
         sheet.recompute();
         // dbg!(&sheet);
         assert_eq!(
             sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
-                .val("=value(0,1)+value(0,0)+value(1,1)".into())
+                .val("=value(.T,0,1)+value(.T,0,0)+value(.T,1,1)".into())
                 .display(Some(ConstType::Num(11.).into()))
                 .deps(HashSet::new()))
         );
@@ -6008,14 +6148,14 @@ mod test {
                 .deps([SLoc("", 1, 0)].into_iter().collect())
                 .display(Some(ConstType::Num(2.).into())))
         );
-        sheet.set_val(&SLoc("", 0, 1), "=value(1,0)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(.T,1,0)".into());
         eprintln!("before loop");
         sheet.recompute();
 
         assert_eq!(
             sheet.get(&SLoc("", 0, 1)),
             Ok(&CellData::default()
-                .val("=value(1,0)".into())
+                .val("=value(.T,1,0)".into())
                 .display(Some(
                     ConstType::Error(CellError::ReferenceLoop {
                         loop_point: Some(SLoc("", 0, 1))
@@ -6027,7 +6167,7 @@ mod test {
         assert_eq!(
             sheet.get(&SLoc("", 1, 0)),
             Ok(&CellData::default()
-                .val("=value(0,1)+value(0,0)+value(1,1)".into())
+                .val("=value(.T,0,1)+value(.T,0,0)+value(.T,1,1)".into())
                 .display(Some(
                     ConstType::Error(CellError::ReferenceLoop {
                         loop_point: Some(SLoc("", 0, 1))
@@ -6036,7 +6176,7 @@ mod test {
                 ))
                 .deps([SLoc("", 0, 1)].into_iter().collect()))
         );
-        sheet.set_val(&SLoc("", 0, 1), "=value(-1,0)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(.T,-1,0)".into());
         sheet.recompute();
         assert_eq!(
             sheet.get_display(&SLoc("", 0, 1)),
@@ -6049,7 +6189,7 @@ mod test {
                 .into()
             )
         );
-        sheet.set_val(&SLoc("", 0, 1), "=value(0, -1)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(.T,0, -1)".into());
         sheet.recompute();
         assert_eq!(
             sheet.get_display(&SLoc("", 0, 1)),
@@ -6062,7 +6202,7 @@ mod test {
                 .into()
             )
         );
-        sheet.set_val(&SLoc("", 0, 1), "=value(0.7,0)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(.T,0.7,0)".into());
         sheet.recompute();
         assert_eq!(
             sheet.get_display(&SLoc("", 0, 1)),
@@ -6075,7 +6215,7 @@ mod test {
                 .into()
             )
         );
-        sheet.set_val(&SLoc("", 0, 1), "=value(0, 0.7)".into());
+        sheet.set_val(&SLoc("", 0, 1), "=value(.T,0, 0.7)".into());
         sheet.recompute();
         assert_eq!(
             sheet.get_display(&SLoc("", 0, 1)),

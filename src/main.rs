@@ -11,17 +11,17 @@ use std::{
 
 use flate2::Compression;
 use formula::{
-    get_range_form, show_ref_local, Acc, AccMode, AndFunc, CallFunc, CeilFunc, CellData, CellError,
-    ColorFunc, ConstFunc, CountIf, FalseFunc, FilterFunc, Function, If, IntegrateFunc, LogFunc,
-    NumConstType, OrFunc, PowFunc, Range, RangeFunc, RoundFunc, SLocBound, SpecValues, TrueFunc,
-    Value, ValueFunc,
+    get_range_form, show_ref_global, show_ref_local, Acc, AccMode, AndFunc, CallFunc, CeilFunc,
+    CellData, CellError, ColorFunc, ConstFunc, CountIf, FalseFunc, FilterFunc, Function, If,
+    IntegrateFunc, LogFunc, NumConstType, OrFunc, PowFunc, Range, RangeFunc, RoundFunc, SLocBound,
+    SpecValues, TrueFunc, ValidFunc, Value, ValueFunc,
 };
 use sdl2::{
     event::{Event, WindowEvent},
     keyboard::{Keycode, Mod},
     mouse::MouseButton,
     pixels::Color,
-    rect::Rect,
+    rect::{Point, Rect},
     ttf,
 };
 
@@ -34,8 +34,27 @@ const RED: Color = Color::RGB(200, 20, 20);
 
 // type Sheet = BTreeMap<(i32, i32), CellData>;
 // whut
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub(crate) struct SLoc(&'static str, i32, i32);
+impl PartialEq for SLoc {
+    fn eq(&self, other: &Self) -> bool {
+        self.1 == other.1 && self.2 == other.2 && self.0 == other.0
+    }
+}
+impl Eq for SLoc {}
+impl Ord for SLoc {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.1
+            .cmp(&other.1)
+            .then_with(|| self.2.cmp(&other.2))
+            .then_with(|| self.0.cmp(&other.0))
+    }
+}
+impl PartialOrd for SLoc {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 #[derive(Debug)]
 pub(crate) struct SheetData(BTreeMap<SLoc, CellData>);
 pub(crate) type SheetEval = BTreeMap<SLoc, usize>;
@@ -106,6 +125,7 @@ impl Default for SheetFunc {
             Box::new(ConstFunc(NumConstType::Pi)),
             Box::new(ConstFunc(NumConstType::E)),
             Box::new(FilterFunc::default()),
+            Box::new(ValidFunc),
         ])
     }
 }
@@ -398,7 +418,7 @@ fn main() {
     let cellw = 90;
     let cellh: i32 = 25;
     let menu = 48;
-    let top: i32 = 96;
+    let top: i32 = 72;
     let tab_bottom: i32 = 35;
     let border = 2; // 4
     let mut height = 800;
@@ -409,7 +429,9 @@ fn main() {
     // let sensitivity = 1;
 
     let sdlttf = ttf::init().unwrap();
-    let mainfont = sdlttf.load_font("UbuntuMono-Regular.ttf", 48).unwrap();
+    let mainfont = sdlttf
+        .load_font("UbuntuMono-Regular.ttf", (top - menu).try_into().unwrap())
+        .unwrap();
     let cellfont = sdlttf
         .load_font("UbuntuMono-Regular.ttf", cellh.try_into().unwrap())
         .unwrap();
@@ -423,7 +445,7 @@ fn main() {
     let texturer = canvas.texture_creator();
     // let window = canvas.into_window();
 
-    let mut selected = None;
+    let mut selected: Option<SLoc> = None;
     let mut prev_val = None;
     let mut data = Sheet::new();
     let mut cursor = None;
@@ -431,6 +453,7 @@ fn main() {
     let mut form_select_end = None;
     let mut form_select_cursor = None;
     let mut form_select_done = true;
+    let mut copy: Option<String> = None;
 
     let mut file = std::env::args()
         .nth(1)
@@ -439,7 +462,8 @@ fn main() {
         file = rfd::FileDialog::new()
             .set_title("Choose a .gg file")
             .add_filter("Gogebia", &["gg"])
-            .save_file();
+            .set_directory(std::env::current_dir().unwrap())
+            .pick_file();
     }
 
     fn load_file(filen: &'static str, data: &mut Sheet) {
@@ -534,12 +558,17 @@ fn main() {
                         // TODO menu and clicking into formula
                         Dirty::No
                     } else if y > height - tab_bottom {
-                        if x > width - tab_bottom {
-                            let new_file = rfd::FileDialog::new()
+                        if x > width - tab_bottom * 2 {
+                            let new_file_pick = rfd::FileDialog::new()
                                 .set_title("Choose a .gg file")
                                 .add_filter("Gogebia", &["gg"])
-                                .set_directory(std::env::current_dir().unwrap())
-                                .pick_file();
+                                .set_directory(std::env::current_dir().unwrap());
+
+                            let new_file = if x > width - tab_bottom {
+                                new_file_pick.save_file()
+                            } else {
+                                new_file_pick.pick_file()
+                            };
 
                             if let Some(new_file) = new_file.and_then(|p| {
                                 if p.parent() == std::env::current_dir().ok().as_deref() {
@@ -574,7 +603,11 @@ fn main() {
                             form_select_done = false;
                             form_select_end = None;
 
-                            let show = show_ref_local(&new);
+                            let show = if new.0 == s.0 {
+                                show_ref_local(&new)
+                            } else {
+                                show_ref_global(&new)
+                            };
                             form_select_cursor = Some(cur..cur + show.len());
                             cursor = Some(cur + show.len());
                             // dbg!(&show);
@@ -648,8 +681,16 @@ fn main() {
                             println!("{curc:?}");
                             form_select_end = Some(curc);
 
-                            let shows = show_ref_local(&start);
-                            let showe = show_ref_local(&curc);
+                            let shows = if start.0 == s.0 {
+                                show_ref_local(&start)
+                            } else {
+                                show_ref_global(&start)
+                            };
+                            let showe = if curc.0 == s.0 {
+                                show_ref_local(&curc)
+                            } else {
+                                show_ref_global(&curc)
+                            };
                             println!("{}:{}", shows, showe);
                             if let Some(v) = data.val_mut(&s) {
                                 match curc.cmp(&start) {
@@ -686,7 +727,7 @@ fn main() {
                     window_id: _,
                     keycode,
                     scancode: _,
-                    keymod: _,
+                    keymod,
                     repeat: _,
                 } => {
                     // if keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD) {
@@ -723,13 +764,41 @@ fn main() {
                                 if cursor.is_some() {
                                     data.dirty(&SLoc(f, x, y));
                                     selected = Some(SLoc(f, x, y + 1));
+                                    shown_file = f;
                                     cursor = None;
+                                    form_select_cursor = None;
+                                    form_select_start = None;
+                                    form_select_end = None;
                                 } else {
                                     cursor = Some(0);
                                 }
                                 Dirty::Recompute
+                            } else if key == Keycode::Escape {
+                                if cursor.is_some() {
+                                    if let Some(fc) = form_select_cursor.clone() {
+                                        if let Some(v) = data.val_mut(&SLoc(f, x, y)) {
+                                            v.replace_range(fc, "");
+                                            form_select_cursor = None;
+                                            form_select_start = None;
+                                            form_select_end = None;
+                                        }
+                                    } else {
+                                        cursor = None;
+                                        let p = prev_val;
+                                        prev_val = None;
+                                        if let Some(prev) = p {
+                                            data.set_val(&SLoc(f, x, y), prev);
+                                        } else {
+                                            data.set_val(&SLoc(f, x, y), "".into());
+                                        }
+                                    }
+                                } else {
+                                    selected = None;
+                                }
+                                Dirty::Visual
                             } else if key == Keycode::Down {
                                 selected = Some(SLoc(f, x, y + 1));
+                                shown_file = f;
                                 let r = if cursor.is_some() {
                                     data.dirty(&SLoc(f, x, y));
                                     cursor = None;
@@ -757,6 +826,7 @@ fn main() {
                                     }
                                 } else {
                                     selected = Some(SLoc(f, (x - 1).max(0), y));
+                                    shown_file = f;
                                     if (x - 1) * cellw < scroll.0 {
                                         scroll.0 = (x - 1).max(0) * cellw;
                                         Dirty::Recompute
@@ -783,6 +853,7 @@ fn main() {
                                     }
                                 } else {
                                     selected = Some(SLoc(f, x + 1, y));
+                                    shown_file = f;
                                     if (x + 3) * cellw > width + scroll.0 {
                                         scroll.0 = (x + 3 - width / cellw) * cellw;
                                         Dirty::Recompute
@@ -792,6 +863,7 @@ fn main() {
                                 }
                             } else if key == Keycode::Up {
                                 selected = Some(SLoc(f, x, (y - 1).max(0)));
+                                shown_file = f;
                                 cursor = None;
                                 if (y - 1) * cellh < scroll.1 {
                                     scroll.1 = (y - 1).max(0) * cellh;
@@ -799,29 +871,6 @@ fn main() {
                                 } else {
                                     Dirty::Visual
                                 }
-                            } else if key == Keycode::Escape {
-                                if cursor.is_some() {
-                                    if let Some(fc) = form_select_cursor.clone() {
-                                        if let Some(v) = data.val_mut(&SLoc(f, x, y)) {
-                                            v.replace_range(fc, "");
-                                            form_select_cursor = None;
-                                            form_select_start = None;
-                                            form_select_end = None;
-                                        }
-                                    } else {
-                                        cursor = None;
-                                        let p = prev_val;
-                                        prev_val = None;
-                                        if let Some(prev) = p {
-                                            data.set_val(&SLoc(f, x, y), prev);
-                                        } else {
-                                            data.set_val(&SLoc(f, x, y), "".into());
-                                        }
-                                    }
-                                } else {
-                                    selected = None;
-                                }
-                                Dirty::Visual
                             } else if key == Keycode::F4 {
                                 if let Some(ref fr) = form_select_cursor {
                                     if let Some(fs) = form_select_start {
@@ -867,6 +916,31 @@ fn main() {
                                 } else {
                                     Dirty::No
                                 }
+                            } else if key == Keycode::C && keymod.contains(Mod::LCTRLMOD) {
+                                copy = data.get_val(&SLoc(f, x, y)).ok().map(|x| x.to_owned());
+                                Dirty::No
+                            } else if key == Keycode::V && keymod.contains(Mod::LCTRLMOD) {
+                                if let Some(copy) = &copy {
+                                    cursor = Some(0);
+                                    data.set_val(&SLoc(f, x, y), copy.clone());
+                                    Dirty::Visual
+                                } else {
+                                    Dirty::No
+                                }
+                            } else if key == Keycode::F12 {
+                                //Debug
+                                if let Ok(cell) = dbg!(data.get(&SLoc(f, x, y))) {
+                                    if let Ok(val) = dbg!(Value::from_str(&cell.val, f)) {
+                                        dbg!(val.eval(
+                                            &data.data,
+                                            &mut data.eval,
+                                            &data.funcs,
+                                            &data.ranges,
+                                            &SpecValues::from_sloc(SLoc(f, x, y))
+                                        ));
+                                    }
+                                }
+                                Dirty::Visual
                             } else {
                                 Dirty::No
                             }
@@ -1150,59 +1224,61 @@ fn main() {
                 }
 
                 // Cell box render
-                let text_res = if let Ok(sd) = data.get(&sloc) {
-                    if cursor.is_some() {
-                        cellfont.render(&sd.val).solid(BLACK).ok()
-                    } else if let Some(d) = &sd.display {
-                        let mut d = d.clone();
-                        d.bgcolor = BLUE.rgb();
-                        cellfont.render_c(&d).ok()
+                if sloc.0 == shown_file {
+                    let text_res = if let Ok(sd) = data.get(&sloc) {
+                        if cursor.is_some() {
+                            cellfont.render(&sd.val).solid(BLACK).ok()
+                        } else if let Some(d) = &sd.display {
+                            let mut d = d.clone();
+                            d.bgcolor = BLUE.rgb();
+                            cellfont.render_c(&d).ok()
+                        } else {
+                            None
+                        }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
-                match text_res {
-                    Some(text) => {
-                        let text_text = texturer.create_texture_from_surface(text).unwrap();
-                        let sm = text_text.query();
-                        select_box(
-                            &mut canvas,
-                            sloc.1,
-                            cellw,
-                            border,
-                            sloc.2,
-                            cellh,
-                            top,
-                            sm.width.checked_sub(cellw as u32).map(|x| x + 4),
-                            scroll,
-                        );
-                        canvas
-                            .copy(
-                                &text_text,
+                    };
+                    match text_res {
+                        Some(text) => {
+                            let text_text = texturer.create_texture_from_surface(text).unwrap();
+                            let sm = text_text.query();
+                            select_box(
+                                &mut canvas,
+                                sloc.1,
+                                cellw,
+                                border,
+                                sloc.2,
+                                cellh,
+                                top,
+                                sm.width.checked_sub(cellw as u32).map(|x| x + 4),
+                                scroll,
+                            );
+                            canvas
+                                .copy(
+                                    &text_text,
+                                    None,
+                                    Some(Rect::new(
+                                        (sloc.1 + 1) * cellw - scroll.0 + border / 2,
+                                        (sloc.2 + 1) * cellh - scroll.1 + border / 2 + top,
+                                        sm.width,
+                                        cellh.try_into().unwrap(),
+                                    )),
+                                )
+                                .unwrap();
+                        }
+                        None => {
+                            select_box(
+                                &mut canvas,
+                                sloc.1,
+                                cellw,
+                                border,
+                                sloc.2,
+                                cellh,
+                                top,
                                 None,
-                                Some(Rect::new(
-                                    (sloc.1 + 1) * cellw - scroll.0 + border / 2,
-                                    (sloc.2 + 1) * cellh - scroll.1 + border / 2 + top,
-                                    sm.width,
-                                    cellh.try_into().unwrap(),
-                                )),
-                            )
-                            .unwrap();
-                    }
-                    None => {
-                        select_box(
-                            &mut canvas,
-                            sloc.1,
-                            cellw,
-                            border,
-                            sloc.2,
-                            cellh,
-                            top,
-                            None,
-                            scroll,
-                        );
+                                scroll,
+                            );
+                        }
                     }
                 }
                 // } else {
@@ -1259,6 +1335,37 @@ fn main() {
                     None => {}
                 }
             }
+
+            canvas.set_draw_color(BLACK);
+            // Draw new file button
+            canvas
+                .draw_line(
+                    (width - tab_bottom / 2, height - tab_bottom + border),
+                    (width - tab_bottom / 2, height - border),
+                )
+                .unwrap();
+            canvas
+                .draw_line(
+                    (width - tab_bottom + border, height - tab_bottom / 2),
+                    (width - border, height - tab_bottom / 2),
+                )
+                .unwrap();
+
+            // Draw open file button
+            canvas
+                .draw_lines(&[
+                    Point::new(width - tab_bottom * 5 / 3, height - border),
+                    Point::new(width - tab_bottom * 4 / 3, height - border),
+                    Point::new(width - border - tab_bottom, height - tab_bottom + border),
+                    Point::new(width - tab_bottom * 4 / 3, height - tab_bottom + border),
+                    Point::new(width - tab_bottom * 5 / 3, height - border),
+                    Point::new(
+                        width - tab_bottom * 2 + border,
+                        height - tab_bottom + border,
+                    ),
+                    Point::new(width - tab_bottom * 4 / 3, height - tab_bottom + border),
+                ] as &[Point])
+                .unwrap();
 
             println!("Drew");
 
@@ -1339,9 +1446,14 @@ mod test {
             "Missing formulas from formula not imported, missing {}",
             avail - sheet.funcs.iter().count()
         );
+        #[rustfmt::skip]
         let names: HashSet<&str> = [
-            "if", "color", "range", "or", "true", "false", "countif", "sum", "value", "and",
-            "round", "ceil", "power", "call",
+            "and", "or", "if", "true", "false",
+            "countif", "sum", "mean", "filter", 
+            "range", "value", "valid", 
+            "round", "ceil", "power", "log", "pi", "e",
+            "call", "intr",
+            "color"
         ]
         .into_iter()
         .collect();
